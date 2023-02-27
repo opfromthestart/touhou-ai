@@ -26,7 +26,7 @@ fn image_to_u8(img: &ImageBuffer<Luma<f32>, Vec<f32>>) -> Image {
     ret_img
 }
 
-fn get_score(img: &Image, nums: &[Image]) -> [u8;8] {
+fn get_score(img: &Image, nums: &[Image]) -> u32 {
     let mut score = [0;8];
 
     let score_img = get_pixel_range(img, (449..577, 97..113));
@@ -44,13 +44,14 @@ fn get_score(img: &Image, nums: &[Image]) -> [u8;8] {
         }
     }
 
-    score
+    score.iter().rev().enumerate().rev().map(|(i,v)| 10u32.pow(i as u32)* *v as u32).sum()
 }
 
 fn main() {
     let (c, screen) = xcb::Connection::connect(None).unwrap();
 
-    thread::sleep(Duration::from_millis(1200));
+    eprintln!("Open the game within 2 seconds of starting this.");
+    thread::sleep(Duration::from_millis(2000));
     let active_cookie = c.send_request(&xcb::x::GetInputFocus {});
     let active = c.wait_for_reply(active_cookie).unwrap();
 
@@ -77,24 +78,24 @@ fn main() {
     }
     eprintln!("{pos:?}");
     
-    let start = std::time::SystemTime::now();
-    let screens = Screen::all().unwrap();
-    eprintln!("Screens: {}", screens.len());
-    let mut images = vec![];
-    for i in 0..1 {
-        let ss = screens[0].capture_area(pos.0, pos.1, 641, 401).unwrap();
-        let mut img = image::load_from_memory(ss.buffer()).unwrap().to_luma8();
-        images.push(img);
-    }
-    eprintln!("{:?}", start.elapsed());
-
-    images.last().unwrap().save_with_format("other_ss.bmp", image::ImageFormat::Bmp).unwrap();
-
     let font = image::open("th2 font.png").unwrap().to_luma8();
     let nums = get_pixel_range(&font, (0..160, 32..48));
     let num_list = (0..10).into_iter().map(|x| {
         get_pixel_range(&nums, ((16*x)..(16*x+16), 0..16))
     }).collect::<Vec<_>>();
+
+    let start = std::time::SystemTime::now();
+    let screens = Screen::all().unwrap();
+    eprintln!("Screens: {}", screens.len());
+    let mut images = vec![];
+    loop {
+        let ss = screens[0].capture_area(pos.0, pos.1, 641, 401).unwrap();
+        let img = image::load_from_memory(ss.buffer()).unwrap().to_luma8();
+        //images.push(img);
+        eprint!("{:?}         \r", get_score(&img, &num_list[..]));
+
+    }
+    eprintln!("{:?}", start.elapsed());
 
     eprintln!("{:?}", get_score(images.last().unwrap(), &num_list[..]));
     //fs::write("win_ss.bmp", images.last().unwrap().buffer()).unwrap();
