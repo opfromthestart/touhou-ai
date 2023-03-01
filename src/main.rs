@@ -20,9 +20,14 @@ fn main() {
     
     let num_list = arena::get_nums();
 
+    let ss = arena::screenshot(pos);
+    ss.save("test_ss.bmp").unwrap();
+
     dbg!("making net");
-    let mut net = net::Net::<Backend<Cuda>>::load_or_new("ai-file/th2_critic.net");
+    let mut net = net::NetCrit::<Backend<Cuda>>::load_or_new("ai-file/th2_critic.net");
     dbg!("MAde net");
+
+    arena::start(pos, &num_list);
 
     let start = std::time::SystemTime::now();
     let mut outp = vec![];
@@ -36,7 +41,9 @@ fn main() {
         //dbg!(&res);
         //res.forward();
         let new_score = arena::get_score(&img, &num_list);
+        
         if let Some(new_score) = new_score {
+            //eprintln!("{:?}", new_score);
             let score_d = new_score - score;
             score = new_score;
 
@@ -51,15 +58,15 @@ fn main() {
         }
         //outp.push(res);
         
-        //eprint!("{:?}         \r", arena::get_score(&img, &num_list[..]));
+        //eprint!("{:?}         \\r", arena::get_score(&img, &num_list[..]));
     }
     dbg!(start.elapsed().unwrap());
 
     let gamma = 0.98;
     let mut acc = 0.0;
     for (data, pred, sc) in outp.iter().rev() {
-        acc += *sc as f32;
         net.train(&[data.to_owned()], &[to_netdata(&[acc-pred[0]])]);
+        acc += *sc as f32;
         acc *= gamma;
     }
 

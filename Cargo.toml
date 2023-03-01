@@ -7,10 +7,9 @@ edition = "2021"
 
 [dependencies]
 coaster = {path = "../math/juice/coaster"}
-# device_query = "1.1.2" #gets pressed keys
+device_query = "1.1.2" #gets pressed keys
 enigo = "0.0.14" # presses keys
 image = "0.24.5" # Loads files
-imageproc = "0.23.0" #finds subimage
 juice = {path = "../math/juice/juice"}
 #mushin = "0.5.0"
 #ndarray = "0.15.6"

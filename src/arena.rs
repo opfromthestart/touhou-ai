@@ -2,9 +2,9 @@
 
 use std::ops::Range;
 
+use device_query::Keycode;
 use enigo::{KeyboardControllable, Key};
-use image::{ImageBuffer, Rgb, Luma};
-use imageproc::template_matching::{match_template, MatchTemplateMethod};
+use image::{ImageBuffer, Rgb, Luma, GenericImageView, buffer::ConvertBuffer};
 
 type Image = ImageBuffer<Rgb<u8>, Vec<u8>>; 
 
@@ -55,12 +55,12 @@ pub(crate) fn screenshot(pos: (i32, i32)) -> Image {
     image::load_from_memory(ss.buffer()).unwrap().to_rgb8()
 }
 
-pub(crate) fn get_nums() -> Vec<[ImageBuffer<Luma<u8>, Vec<u8>>; 3]> {
+pub(crate) fn get_nums() -> Vec<Image> {
     let font = image::open("th2 font.png").unwrap().to_rgb8();
     let nums = get_pixel_range(&font, (0..160, 32..48));
     (0..10).into_iter().map(|x| {
         get_pixel_range(&nums, ((16*x)..(16*x+16), 0..16))
-    }).map(|x| split_channel(&x)).collect::<Vec<_>>()
+    }).collect::<Vec<_>>()
 }
 
 pub(crate) fn get_pixel_range(img: &Image, area: (Range<u32>, Range<u32>)) -> Image {
@@ -92,27 +92,111 @@ pub(crate) fn split_channel(img: &Image) -> [ImageBuffer<Luma<u8>, Vec<u8>>; 3] 
     ret
 }
 
-pub(crate) fn get_score(img: &Image, nums: &[[ImageBuffer<Luma<u8>, Vec<u8>>;3]]) -> Option<u32> {
+pub(crate) fn match_template(
+    image: &Image,
+    template: &Image,
+) -> ImageBuffer<Luma<f32>, Vec<f32>> {
+    let (image_width, image_height) = image.dimensions();
+    let (template_width, template_height) = template.dimensions();
+
+    assert!(
+        image_width >= template_width,
+        "image width must be greater than or equal to template width"
+    );
+    assert!(
+        image_height >= template_height,
+        "image height must be greater than or equal to template height"
+    );
+    
+    let mut result = ImageBuffer::new(
+        image_width - template_width + 1,
+        image_height - template_height + 1,
+    );
+
+    for y in 0..result.height() {
+        for x in 0..result.width() {
+            let mut score = 0f32;
+
+            for dy in 0..template_height {
+                for dx in 0..template_width {
+                    let image_value = unsafe { image.unsafe_get_pixel(x + dx, y + dy).0};
+                    let template_value = unsafe { template.unsafe_get_pixel(dx, dy).0};
+
+                    score += image_value.iter().zip(template_value.iter()).map(|(i,t)| (*i as f32 - *t as f32).powf(2.0)).sum::<f32>();
+                }
+            }
+
+            result.put_pixel(x, y, Luma([score]));
+        }
+    }
+
+    result
+}
+
+pub(crate) fn img_diff(
+    image1: &Image,
+    image2: &Image,
+) -> Image {
+    let (width1, height1) = image1.dimensions();
+    let (width2, height2) = image2.dimensions();
+
+    assert!(
+        width1 == width2,
+        "image widths must be equal"
+    );
+    assert!(
+        height1 == height2,
+        "image heights must be equal"
+    );
+    
+    let mut result = ImageBuffer::new(
+        width1,
+        height1,
+    );
+
+    for y in 0..result.height() {
+        for x in 0..result.width() {
+
+            let image_value = unsafe { image1.unsafe_get_pixel(x, y ).0};
+            let template_value = unsafe { image2.unsafe_get_pixel(x, y).0};
+
+            let score = image_value.iter().zip(template_value.iter()).map(|(i,t)| i-t).collect::<Vec<_>>();
+            let score = [score[0],score[1],score[2]];
+
+            result.put_pixel(x, y, Rgb(score));
+        }
+    }
+
+    result
+}
+
+pub(crate) fn get_score(img: &Image, nums: &[Image]) -> Option<u32> {
     let mut score = [20;8];
 
     let score_img = get_pixel_range(img, (449..577, 97..113));
-    let [r,g,b] = split_channel(&score_img);
     //score_img.save("score check/score.png").unwrap();
     for (i,n) in nums.iter().enumerate() {
-        let matching_r = match_template(&r, &n[0], MatchTemplateMethod::SumOfSquaredErrorsNormalized);
-        let matching_g = match_template(&g, &n[1], MatchTemplateMethod::SumOfSquaredErrorsNormalized);
-        let matching_b = match_template(&b, &n[2], MatchTemplateMethod::SumOfSquaredErrorsNormalized);
-        let matching = matching_r.pixels().zip(matching_g.pixels()).zip(matching_b.pixels()).map(|((r,g),b)| r.0[0]+b.0[0]+g.0[0]).collect::<Vec<f32>>();
+        let matching = match_template(&score_img, n).pixels().map(|p| p.0[0]).collect::<Vec<_>>();
+
         //let ext = matching.iter().copied().reduce(|x,y| x.min(y)).unwrap();
         
         //image_to_u8(&matching).save(format!("score check/{i}.png")).unwrap();
-        //eprintln!("{ext:?}");
+        //eprintln!("{i}: {ext:?}");
+
+        //if i == 6 {
+        //    get_pixel_range(&score_img, (64..80, 0..16)).save("6 ss.png").unwrap();
+        //    n.save("6 temp.png").unwrap();
+        //    img_diff(n, &get_pixel_range(&score_img, (64..80, 0..16))).save("6 comp.png").unwrap();
+        //}
+        //eprintln!("{}", matching.len());
         for s in 0..8 {
-            if matching[s*16] < 0.024 { // For some reason 6 doesnt match pixel perfect, this is zero for all others.
+            if matching[s*16] == 0.0 { // For some reason 6 doesnt match pixel perfect, this is zero for all others.
                 score[s] = i as u8;
             }
         }
     }
+
+    eprintln!("{score:?}");
 
     if score.iter().find(|x| **x==20).is_some() {
         None
@@ -122,7 +206,7 @@ pub(crate) fn get_score(img: &Image, nums: &[[ImageBuffer<Luma<u8>, Vec<u8>>;3]]
     }
 }
 
-pub(crate) fn do_out(buttons: &[bool]) {
+pub(crate) fn do_keys(buttons: &[bool]) {
     let mut e = enigo::Enigo::new();
     if buttons[0] {
         e.key_click(Key::Layout('z'));
@@ -142,4 +226,77 @@ pub(crate) fn do_out(buttons: &[bool]) {
     if buttons[5] {
         e.key_click(Key::RightArrow);
     }
+}
+
+pub(crate) fn get_keys() -> [bool;6] {
+    let d = device_query::DeviceState::new();
+    let keys = d.query_keymap();
+    [Keycode::Z, Keycode::X, Keycode::Up, Keycode::Down, Keycode::Left, Keycode::Right]
+    .map(|v| keys.contains(&v))
+}
+
+#[derive(PartialEq, Eq)]
+enum PauseState {
+    Return,
+    Quit,
+    Kidding,
+    Really,
+}
+
+#[derive(PartialEq, Eq)]
+enum Mode {
+    Start,
+    Demo,
+    Select,
+    Game,
+    Paused(PauseState),
+    GameOver(bool),
+    Continue(bool),
+    Between,
+}
+
+fn get_mode(pos: (i32, i32), nums: &[Image]) -> Mode {
+    let ss = screenshot(pos);
+
+    if ss.get_pixel(420, 69).0 == [119, 119, 153] { // Checks a background pixel for blueish color
+        Mode::Select
+    }
+    else if ss.get_pixel(420, 69).0 == [255, 255, 0] { // Checks a text pixel for yellow color
+        Mode::Start
+    }
+    else if (244..=254).all(|y| ss.get_pixel(202, y).0 == [255,255,255]) { // Checks the vertical line of the R in Return
+        Mode::Paused(PauseState::Return)
+    }
+    else if (260..=269).all(|y| ss.get_pixel(236, y).0 == [255,255,255]) { // Checks the vertical line of the I in I was just kidding. Sorry.
+        Mode::Paused(PauseState::Quit)
+    }
+    else if (244..=254).all(|y| ss.get_pixel(141, y).0 == [255,255,255]) { // Checks the vertical line of the I in Yes, I'll quit.
+        Mode::Paused(PauseState::Kidding)
+    }
+    else if (260..=270).all(|y| ss.get_pixel(213, y).0 == [255,255,255]) { // Checks the vertial line of the t in Quit
+        Mode::Paused(PauseState::Really)
+    }
+    else if get_score(&ss, nums).is_some() {
+        Mode::Game
+    }
+    else {
+        Mode::Between
+    }
+}
+
+pub(crate) fn start(pos: (i32, i32), nums: &[Image]) {
+    let mut e = enigo::Enigo::new();
+    while get_mode(pos, nums) == Mode::Game {
+        e.key_click(Key::Layout('z'));
+    }
+    while get_mode(pos, nums) != Mode::Game {
+        e.key_click(Key::Layout('z'));
+    }
+}
+
+pub(crate) fn reset(pos: (i32, i32), nums: &[Image]) {
+    let mut e = enigo::Enigo::new();
+    //e.key_click(Key::Escape)
+
+    start(pos, nums);
 }

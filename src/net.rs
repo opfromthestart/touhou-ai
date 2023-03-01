@@ -25,7 +25,7 @@ pub(crate) fn from_netdata<T: Clone>(t: &NetData<T>) -> Vec<T> {
     t.read().unwrap().read(dev).unwrap().as_slice::<T>().to_owned()
 }
 
-pub(crate) struct Net<B: IBackend> {
+pub(crate) struct NetCrit<B: IBackend> {
     data: Layer<B>,
 }
 
@@ -106,7 +106,7 @@ fn net_conf_critic() -> SequentialConfig {
         conf
 }
 
-impl Net<Backend<Cuda>> {
+impl NetCrit<Backend<Cuda>> {
     pub(crate) fn new() -> Self {
         //let middle = 10*(640-12)*(400-12);
         let back = Rc::new(get_cuda_backend());
@@ -145,7 +145,7 @@ impl Net<Backend<Cuda>> {
     }
 }
 
-impl Net<Backend<Native>> {
+impl NetCrit<Backend<Native>> {
     pub(crate) fn new() -> Self {
         //let middle = 10*(640-12)*(400-12);
         let back = Rc::new(get_native_backend());
@@ -155,7 +155,7 @@ impl Net<Backend<Native>> {
     }
 }
 
-impl<B: IBackend> Net<B> {
+impl<B: IBackend> NetCrit<B> {
     pub(crate) fn forward(&mut self, x: &[NetData<f32>]) -> Vec<NetData<f32>>
     {
         self.data.forward(x)
