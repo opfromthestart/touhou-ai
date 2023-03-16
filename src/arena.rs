@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use device_query::Keycode;
 use enigo::{KeyboardControllable, Key};
-use image::{ImageBuffer, Rgb, Luma, GenericImageView, buffer::ConvertBuffer};
+use image::{ImageBuffer, Rgb, Luma, GenericImageView, EncodableLayout};
 
 type Image = ImageBuffer<Rgb<u8>, Vec<u8>>; 
 
@@ -170,6 +170,10 @@ pub(crate) fn img_diff(
     result
 }
 
+pub(crate) fn to_pixels(img: &Image) -> Vec<f32> {
+    img.as_bytes().iter().map(|x| *x as f32/256.).collect::<Vec<_>>()
+}
+
 pub(crate) fn get_score(img: &Image, nums: &[Image]) -> Option<u32> {
     let mut score = [20;8];
 
@@ -196,7 +200,7 @@ pub(crate) fn get_score(img: &Image, nums: &[Image]) -> Option<u32> {
         }
     }
 
-    eprintln!("{score:?}");
+    //eprintln!("{score:?}");
 
     if score.iter().find(|x| **x==20).is_some() {
         None

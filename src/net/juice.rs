@@ -117,10 +117,13 @@ impl NetCrit<Backend<Cuda>> {
     }
 
     pub(crate) fn train(&mut self, inp: &[NetData<f32>], err: &[NetData<f32>]) {
+        //eprintln!("{:?}", inp[0].read().unwrap().desc());
+        //eprintln!("{:?}", err[0].read().unwrap().desc());
         self.forward(inp);
         let _ = self.back(err);
         let back = Rc::new(get_cuda_backend());
         let mut solv = Momentum::<Backend<Cuda>>::new(back.clone());
+        solv.init(&self.data);
         let solv_c = SolverConfig::default();
         solv.compute_update(&solv_c, &mut self.data, 0);
         self.data.update_weights(back.as_ref());
