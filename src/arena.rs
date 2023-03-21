@@ -6,7 +6,8 @@ use device_query::Keycode;
 use enigo::{KeyboardControllable, Key};
 use image::{ImageBuffer, Rgb, Luma, GenericImageView, EncodableLayout};
 
-type Image = ImageBuffer<Rgb<u8>, Vec<u8>>; 
+pub(crate) type Image = ImageBuffer<Rgb<u8>, Vec<u8>>; 
+pub(crate) type GrayImage = ImageBuffer<Luma<u8>, Vec<u8>>;
 
 pub(crate) fn get_active_window_pos() -> (i32, i32) {
     let (c, _screen) = xcb::Connection::connect(None).unwrap();
@@ -56,7 +57,7 @@ pub(crate) fn screenshot(pos: (i32, i32)) -> Image {
 }
 
 pub(crate) fn get_nums() -> Vec<Image> {
-    let font = image::open("th2 font.png").unwrap().to_rgb8();
+    let font = image::open("images/th2 font.png").unwrap().to_rgb8();
     let nums = get_pixel_range(&font, (0..160, 32..48));
     (0..10).into_iter().map(|x| {
         get_pixel_range(&nums, ((16*x)..(16*x+16), 0..16))
@@ -83,7 +84,7 @@ pub(crate) fn image_to_u8(img: &ImageBuffer<Rgb<f32>, Vec<f32>>) -> Image {
     ret_img
 }
 
-pub(crate) fn split_channel(img: &Image) -> [ImageBuffer<Luma<u8>, Vec<u8>>; 3] {
+pub(crate) fn split_channel(img: &Image) -> [GrayImage; 3] {
     let mut ret = [ImageBuffer::new(img.width(), img.height()), ImageBuffer::new(img.width(), img.height()), ImageBuffer::new(img.width(), img.height()), ];
     let [r,g,b] = &mut ret;
     for (((p, r), g), b) in img.pixels().zip(r.iter_mut()).zip(g.iter_mut()).zip(b.iter_mut()) {
@@ -170,9 +171,9 @@ pub(crate) fn img_diff(
     result
 }
 
-pub(crate) fn to_pixels(img: &Image) -> Vec<f32> {
-    img.as_bytes().iter().map(|x| *x as f32/256.).collect::<Vec<_>>()
-}
+//pub(crate) fn to_pixels(img: &Image) -> Vec<f32> {
+//    img.as_bytes().iter().map(|x| *x as f32/256.).collect::<Vec<_>>()
+//}
 
 pub(crate) fn get_score(img: &Image, nums: &[Image]) -> Option<u32> {
     let mut score = [20;8];

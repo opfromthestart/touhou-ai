@@ -6,16 +6,18 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bincode = "1.3.3"
-coaster = {path = "../math/juice/coaster"}
+clap = { version = "4.1", features = ["derive"] }
+#bincode = "1.3.3"
+#coaster = {path = "../math/juice/coaster"}
 device_query = "1.1.2" #gets pressed keys
-dfdx = {git = "https://github.com/coreylowman/dfdx", features = ["nightly", "numpy"]}
+dfdx = {path = "../dfdx", features = ["nightly", "numpy", "cuda"]}
 enigo = "0.0.14" # presses keys
 image = "0.24.5" # Loads files
-juice = {path = "../math/juice/juice"}
+#juice = {path = "../math/juice/juice"}
 #mushin = "0.5.0"
-ndarray = "0.15.6"
-neuronika = {path = "../neuronika", features=["serialize"]}
+#ndarray = "0.15.6"
+#neuronika = {path = "../neuronika", features=["serialize"]}
+rand = "0.8"
 screenshots = "0.5.2" #takes screenshot
 serde = { version = "1.0.155", features = ["derive"] }
 xcb = "1.2.0" # finds active window
