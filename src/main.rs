@@ -296,7 +296,7 @@ fn train_encode() {
 
 fn test_encode() {
 
-    let to_run = image::open("images/test img.png").unwrap().to_rgb8();
+    let to_run = image::open("dbg_images/test img.png").unwrap().to_rgb8();
     let to_run_pix = net::to_pixels(&to_run);
     let c = 640*400;
     let mut ins = [GrayImage::default(), GrayImage::default(), GrayImage::default()];
