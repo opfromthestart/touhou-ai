@@ -5,7 +5,9 @@ use std::{thread, time::Duration, ops::{Div, Mul}};
 use arena::{GrayImage, join_channel};
 use clap::Parser;
 use net::{to_rb, from_pixels};
-use rand::{seq::SliceRandom, thread_rng};
+use rand::{seq::SliceRandom, thread_rng, RngCore};
+
+use crate::arena::wants_exit;
 
 //use coaster::{Backend, Cuda, frameworks::cuda::get_cuda_backend};
 //use ndarray::Dim;
@@ -19,6 +21,7 @@ enum Mode {
     Train,
     TrainEncode,
     EvalEncode,
+    Gather,
 }
 
 fn main() {
@@ -29,6 +32,7 @@ fn main() {
         Mode::Train => train(),
         Mode::TrainEncode => train_encode(),
         Mode::EvalEncode => test_encode(),
+        Mode::Gather => gather(),
     }
     //test_img();
 }
@@ -45,7 +49,7 @@ fn train() {
     let num_list = arena::get_nums();
 
     let ss = arena::screenshot(pos);
-    ss.save("images/test_ss.bmp").unwrap();
+    ss.save("dbg_images/test_ss.bmp").unwrap();
 
     eprintln!("making net");
     let mut net = net::NetCrit::load_or_new("ai-file/th2_critic.net"); //::<Backend<Cuda>>
@@ -186,7 +190,7 @@ fn permute<T>(v: &mut [T], p: &[usize]) {
 
 fn test_img() {
 
-    let to_run = image::open("images/test img.png").unwrap().to_rgb8();
+    let to_run = image::open("dbg_images/test img.png").unwrap().to_rgb8();
     let to_run_pix = net::to_pixels(&to_run);
     //eprintln!("{:?}", to_run_pix)eprintln!("making net");
     let net = net::NetCrit::load_or_new("ai-file/th2_critic.net"); //::<Backend<Cuda>>
@@ -196,11 +200,11 @@ fn test_img() {
     eprintln!("weight: {:?}", t);
     conv.into_iter().enumerate()
     .map(|(i,p)| (to_rb(&p, (39, 24), true), i))
-    .for_each(|(x, i)| x.save(format!("images/post_conv{i}.png")).unwrap());
+    .for_each(|(x, i)| x.save(format!("dbg_images/post_conv{i}.png")).unwrap());
     let score = net.forward(&to_run_pix, &[1.0,0.0,0.0,1.0,0.0,0.0]);
     eprintln!("Score: {score:?}");
 
-    let to_run = image::open("images/test img2.png").unwrap().to_rgb8();
+    let to_run = image::open("dbg_images/test img2.png").unwrap().to_rgb8();
     let to_run_pix = net::to_pixels(&to_run);
     //eprintln!("{:?}", to_run_pix)eprintln!("making net");
     let net = net::NetCrit::load_or_new("ai-file/th2_critic.net"); //::<Backend<Cuda>>
@@ -209,7 +213,7 @@ fn test_img() {
     eprintln!("weight: {:?}", t);
     conv.into_iter().enumerate()
     .map(|(i,p)| (to_rb(&p, (39,24), true), i))
-    .for_each(|(x, i)| x.save(format!("images/post_conv{i}_2.png")).unwrap());
+    .for_each(|(x, i)| x.save(format!("dbg_images/post_conv{i}_2.png")).unwrap());
     let score = net.forward(&to_run_pix, &[1.0,0.0,0.0,1.0,0.0,0.0]);
     eprintln!("Score: {score:?}");
 
@@ -243,7 +247,7 @@ fn train_encode() {
     let num_list = arena::get_nums();
 
     let ss = arena::screenshot(pos);
-    ss.save("images/test_ss.bmp").unwrap();
+    ss.save("dbg_images/test_ss.bmp").unwrap();
 
     eprintln!("making net");
     let mut net = net::NetAutoEncode::load_or_new("ai-file/th2_encode.net"); //::<Backend<Cuda>>
@@ -341,7 +345,7 @@ fn test_encode() {
     ins[0] = from_pixels(&&to_run_pix[0..c], (640, 400));
     ins[1] = from_pixels(&&to_run_pix[c..2*c], (640, 400));
     ins[2] = from_pixels(&&to_run_pix[2*c..], (640, 400));
-    join_channel(&ins).save("images/as_input.png").unwrap();
+    join_channel(&ins).save("dbg_images/as_input.png").unwrap();
     //eprintln!("{:?}", to_run_pix);
     //eprintln!("making net");
     let net = net::NetAutoEncode::load_or_new("ai-file/th2_encode.net"); //::<Backend<Cuda>>
@@ -353,6 +357,56 @@ fn test_encode() {
     grays[1] = from_pixels(&conv[1], (640, 400));
     grays[2] = from_pixels(&conv[2], (640, 400));
     
-    join_channel(&grays).save("images/encoded.png").unwrap()
+    join_channel(&grays).save("dbg_images/encoded.png").unwrap()
 
+}
+
+fn gather() {
+
+    eprintln!("Open the game within 2 seconds of starting this.");
+    thread::sleep(Duration::from_millis(2000));
+
+    let pos = arena::get_active_window_pos();
+
+    eprintln!("{pos:?}");
+    
+    let num_list = arena::get_nums();
+
+    let ss = arena::screenshot(pos);
+    ss.save("dbg_images/test_ss.bmp").unwrap();
+    
+    arena::start(pos, &num_list);
+
+    eprintln!("Start playing now");
+
+    let start = std::time::SystemTime::now();
+
+    let mut outp = vec![];
+
+    let frame_time = 1.0/60.0;
+    let mut frame_el;
+    loop {
+        frame_el = std::time::SystemTime::now();
+        let img = arena::screenshot(pos);
+
+        outp.push(img);
+
+        // Will run out of memory for me if larger (i have 32 GB)
+        if outp.len() > 7000 || wants_exit() {
+            break;
+        }
+
+        while frame_el.elapsed().unwrap().as_secs_f32() < frame_time {
+            thread::sleep(Duration::from_secs_f32(frame_time).saturating_sub(frame_el.elapsed().unwrap()))
+        }
+    }
+    dbg!(start.elapsed().unwrap());
+    let l = outp.len() as f32;
+    let mut r = thread_rng();
+    for (i, img) in outp.into_iter().enumerate() {
+        img.save(format!("images/encoder_data/{}_{}_{}.png", r.next_u32(), r.next_u32(), r.next_u32())).unwrap();
+        if i%500 == 0 {
+            println!("Got {i} done, {}", i as f32/l);
+        }
+    }
 }

@@ -249,6 +249,12 @@ pub(crate) fn get_keys() -> [bool;6] {
     .map(|v| keys.contains(&v))
 }
 
+pub(crate) fn wants_exit() -> bool {
+    let d = device_query::DeviceState::new();
+    let keys = d.query_keymap();
+    keys.contains(&Keycode::Dot) || keys.contains(&Keycode::Escape)
+}
+
 #[derive(PartialEq, Eq)]
 enum PauseState {
     Return,
