@@ -15,30 +15,30 @@ type NetConvCRes = (
     (
         Dropout,
         GeneralizedResidual<(
-            Conv2D<3, 16, 3, 1, 0>,
-            Bias2D<16>,
-            PReLU1D<Const<16>>,
+            Conv2D<3, 64, 3, 1, 1>,
+            Bias2D<64>,
+            PReLU1D<Const<64>>,
             MaxPool2D<2,2,0>,
         ), 
-        (Conv2D<3, 16, 1, 3, 0>, Upscale2D<79, 49>)>,
+        Conv2D<3, 64, 1, 2, 0>>,
     ),
     (
         Dropout,
         GeneralizedResidual<(
-        Conv2D<16, 64, 3, 1, 0>,
-        Bias2D<64>,
-        PReLU1D<Const<64>>,
+        Conv2D<64, 128, 3, 1, 1>,
+        Bias2D<128>,
+        PReLU1D<Const<128>>,
         MaxPool2D<2,2,0>,
-    ), (Conv2D<16, 64, 1, 3, 0>, Upscale2D<38, 23>)>,
+    ), Conv2D<64, 128, 1, 2, 0>>,
 ),
     (
         Dropout,
         GeneralizedResidual<(
-        Conv2D<64, 10, 3, 1, 0>,
-        Bias2D<10>,
-        PReLU1D<Const<10>>,
-        MaxPool2D<2,2,0>,
-    ), (Conv2D<64, 10, 1, 3, 0>, Upscale2D<18, 10>)>,),
+        Conv2D<128, 20, 3, 1, 1>,
+        Bias2D<20>,
+        PReLU1D<Const<20>>,
+        MaxPool2D<3,3,1>,
+    ), Conv2D<128, 20, 1, 3, 0>>,),
     Dropout,
 );
 type NetConvCN = (
@@ -46,7 +46,7 @@ type NetConvCN = (
     (
         Dropout,
         (
-            Conv2D<3, 64, 3, 1, 0>,
+            Conv2D<3, 64, 3, 1, 1>,
             Bias2D<64>,
             PReLU1D<Const<64>>,
             MaxPool2D<2,2,0>,
@@ -55,7 +55,7 @@ type NetConvCN = (
     (
         Dropout,
         (
-        Conv2D<64, 128, 3, 1, 0>,
+        Conv2D<64, 128, 3, 1, 1>,
         Bias2D<128>,
         PReLU1D<Const<128>>,
         MaxPool2D<2,2,0>,
@@ -64,21 +64,21 @@ type NetConvCN = (
     (
         Dropout,
         (
-        Conv2D<128, 20, 3, 1, 0>,
+        Conv2D<128, 20, 3, 1, 1>,
         Bias2D<20>,
         PReLU1D<Const<20>>,
-        MaxPool2D<2,2,0>,
+        MaxPool2D<3,3,1>,
         )
     ),
     Dropout,
 );
 type NetConvLin = (
     Flatten2D,
-    Linear<3600, 128>,
+    Linear<2520, 128>,
     PReLU,
 );
 type NetConv = (
-    NetConvCN,
+    NetConvCRes,
     NetConvLin,
 );
 type NetConvTransLin = (Linear<128, 128>, PReLU, Linear<128, 3600>, PReLU);
@@ -86,58 +86,56 @@ type NetConvTransCRes = (
     (
         Dropout,
         GeneralizedResidual<(
-            Upscale2D<40,25>,
-        Conv2D<20, 128, 3, 2, 0>,
+        ConvTrans2D<20, 128, 4, 2, 1>,
         Bias2D<128>,
-        PReLU1D<Const<128>>,),
-        (Upscale2D<38, 23>, Conv2D<20, 128, 1, 1, 0>)>,
+        PReLU1D<Const<128>>,), 
+        ConvTrans2D<20, 128, 2, 2, 0>>,
     ),
     (
         Dropout,
         GeneralizedResidual<(
-            Upscale2D<81,51>,
-        Conv2D<64, 16, 3, 2, 0>,
-        Bias2D<16>,
-        PReLU1D<Const<16>>,),
-        (Upscale2D<79, 49>, Conv2D<64, 16, 1, 1, 0>)>,
+        ConvTrans2D<128, 64, 4, 2, 1>,
+        Bias2D<64>,
+        PReLU1D<Const<64>>,),
+        ConvTrans2D<128, 64, 2, 2, 0>>,
     ),
     (
         Dropout,
         GeneralizedResidual<(
-            Upscale2D<162,102>,
-        Conv2D<16, 3, 3, 2, 0>,
+        ConvTrans2D<64, 3, 4, 2, 1>,
         Bias2D<3>,
         PReLU1D<Const<3>>,),
-        (Upscale2D<160, 100>, Conv2D<16, 3, 1, 1, 0>)>,
+        ConvTrans2D<64, 3, 2, 2, 0>>,
     ),
+    ConvTrans2D<3, 3, 4, 4, 0>,
     Upscale2D<640, 400, Bilinear>,
 );
 type NetConvTransCN = (
     (
         Dropout,
         (
-        ConvTrans2D<20, 128, 3, 2, 0>,
+        ConvTrans2D<20, 128, 3, 2, 1>,
         Bias2D<128>,
         PReLU1D<Const<128>>,),
     ),
     (
         Dropout,
         (
-        ConvTrans2D<128, 64, 3, 2, 0>,
+        ConvTrans2D<128, 64, 3, 2, 1>,
         Bias2D<64>,
         PReLU1D<Const<64>>,),
     ),
     (
         Dropout,
         (
-        ConvTrans2D<64, 3, 3, 2, 0>,
+        ConvTrans2D<64, 3, 3, 2, 1>,
         Bias2D<3>,
         PReLU1D<Const<3>>,),
     ),
     ConvTrans2D<3, 3, 4, 4, 0>,
     Upscale2D<640, 400, Bilinear>,
 );
-type NetConvTransC = NetConvTransCN;
+type NetConvTransC = NetConvTransCRes;
 type NetLinCrit = (
     (
     Linear<134, 128>,
@@ -270,7 +268,7 @@ impl NetCrit {
     }
 
     pub(crate) fn train_batch<const BATCH: usize>(&mut self, img: &[&[f32]], keys: &[&[f32]], out: &[&[f32]]) -> f32 {
-
+        
         let grads = self.net.alloc_grads();
 
         let (r, _) = self.train_grad::<BATCH>(img, keys, out, grads);
