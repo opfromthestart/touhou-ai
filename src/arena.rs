@@ -1,10 +1,11 @@
 // Everything to setup the training, eg the arena.
 
-use std::ops::Range;
+use std::{ops::Range, fs};
 
 use device_query::Keycode;
 use enigo::{KeyboardControllable, Key};
 use image::{ImageBuffer, Rgb, Luma, GenericImageView};
+use rand::{thread_rng, seq::SliceRandom};
 
 pub(crate) type Image = ImageBuffer<Rgb<u8>, Vec<u8>>; 
 pub(crate) type GrayImage = ImageBuffer<Luma<u8>, Vec<u8>>;
@@ -319,4 +320,19 @@ pub(crate) fn reset(pos: (i32, i32), nums: &[Image]) {
     //e.key_click(Key::Escape)
 
     start(pos, nums);
+}
+
+pub(crate) fn get_enc_batch(n: usize) -> Vec<Image> {
+    let mut r = thread_rng();
+    let files = fs::read_dir("images/encoder_data").unwrap();
+    let to_ret : Vec<_> = files.filter_map(|x| {
+        let y = x.unwrap();
+        if y.file_type().unwrap().is_file() {
+            Some(y.path())
+        }
+        else {
+            None
+        }
+    }).collect();
+    to_ret.choose_multiple(&mut r, n).into_iter().map(|f| image::open(f).unwrap().into_rgb8()).collect()
 }

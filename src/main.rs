@@ -7,7 +7,7 @@ use clap::Parser;
 use net::{to_rb, from_pixels};
 use rand::{seq::SliceRandom, thread_rng, RngCore};
 
-use crate::arena::wants_exit;
+use crate::arena::{wants_exit, Image, get_enc_batch};
 
 //use coaster::{Backend, Cuda, frameworks::cuda::get_cuda_backend};
 //use ndarray::Dim;
@@ -32,13 +32,13 @@ fn main() {
         Mode::Train => train(),
         Mode::TrainEncode => train_encode(),
         Mode::EvalEncode => test_encode(),
-        Mode::Gather => gather(),
+        Mode::Gather => gather_encode(),
     }
     //test_img();
 }
 
 fn train() {
-
+    todo!("Load from files, but files arent done yet");
     eprintln!("Open the game within 2 seconds of starting this.");
     thread::sleep(Duration::from_millis(2000));
 
@@ -236,50 +236,10 @@ fn does_permute() {
 }
 
 fn train_encode() {
-
-    eprintln!("Open the game within 2 seconds of starting this.");
-    thread::sleep(Duration::from_millis(2000));
-
-    let pos = arena::get_active_window_pos();
-
-    eprintln!("{pos:?}");
-    
-    let num_list = arena::get_nums();
-
-    let ss = arena::screenshot(pos);
-    ss.save("dbg_images/test_ss.bmp").unwrap();
+    let datasize = 4000;
 
     eprintln!("making net");
     let mut net = net::NetAutoEncode::load_or_new("ai-file/th2_encode.net"); //::<Backend<Cuda>>
-    eprintln!("Initializing");
-
-    arena::start(pos, &num_list);
-
-    eprintln!("Start playing now");
-
-    let start = std::time::SystemTime::now();
-
-    let mut outp = vec![];
-
-    let frame_time = 1.0/60.0;
-    let mut frame_el;
-    loop {
-        frame_el = std::time::SystemTime::now();
-        let img = arena::screenshot(pos);
-        let img_pix = net::to_pixels(&img);
-
-        outp.push(img_pix);
-
-        // TEST
-        if outp.len() > 7000 {
-            break;
-        }
-
-        while frame_el.elapsed().unwrap().as_secs_f32() < frame_time {
-            thread::sleep(Duration::from_secs_f32(frame_time).saturating_sub(frame_el.elapsed().unwrap()))
-        }
-    }
-    dbg!(start.elapsed().unwrap());
 
     let mut acc_err = 1.0;
     let mut epoch = 0;
@@ -290,13 +250,11 @@ fn train_encode() {
 
     const BATCH: usize = 1;
 
-    let mut r = thread_rng();
-    let mut perm = (0..outp.len()).collect::<Vec<_>>();
+    let mut outp: Vec<Vec<f32>>;
 
     while acc_err > target_err {
-        perm.shuffle(&mut r);
-
-        permute(&mut outp, &perm);
+        eprint!("Loading images\r");
+        outp = get_enc_batch(datasize).into_iter().map(|x| net::to_pixels(&x)).collect();
 
         let epoch_start = std::time::SystemTime::now();
 
@@ -361,7 +319,7 @@ fn test_encode() {
 
 }
 
-fn gather() {
+fn gather_encode() {
 
     eprintln!("Open the game within 2 seconds of starting this.");
     thread::sleep(Duration::from_millis(2000));
@@ -374,7 +332,57 @@ fn gather() {
 
     let ss = arena::screenshot(pos);
     ss.save("dbg_images/test_ss.bmp").unwrap();
+
+    arena::start(pos, &num_list);
+
+    eprintln!("Start playing now");
+
+    let start = std::time::SystemTime::now();
+
+    let mut outp = vec![];
+
+    let frame_time = 1.0/60.0;
+    let mut frame_el;
+    loop {
+        frame_el = std::time::SystemTime::now();
+        let img = arena::screenshot(pos);
+
+        outp.push(img);
+
+        // Will run out of memory for me if larger (i have 32 GB)
+        if outp.len() > 7000 || wants_exit() {
+            break;
+        }
+
+        while frame_el.elapsed().unwrap().as_secs_f32() < frame_time {
+            thread::sleep(Duration::from_secs_f32(frame_time).saturating_sub(frame_el.elapsed().unwrap()))
+        }
+    }
+    dbg!(start.elapsed().unwrap());
+    let l = outp.len() as f32;
+    let mut r = thread_rng();
+    for (i, img) in outp.into_iter().enumerate() {
+        img.save(format!("images/encoder_data/{}_{}_{}.png", r.next_u32(), r.next_u32(), r.next_u32())).unwrap();
+        if i%500 == 0 {
+            println!("Got {i} done, {}", i as f32/l);
+        }
+    }
+}
+
+fn gather_score() {
+
+    eprintln!("Open the game within 2 seconds of starting this.");
+    thread::sleep(Duration::from_millis(2000));
+
+    let pos = arena::get_active_window_pos();
+
+    eprintln!("{pos:?}");
     
+    let num_list = arena::get_nums();
+
+    let ss = arena::screenshot(pos);
+    ss.save("dbg_images/test_ss.bmp").unwrap();
+
     arena::start(pos, &num_list);
 
     eprintln!("Start playing now");
