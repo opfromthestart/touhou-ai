@@ -361,8 +361,8 @@ impl NetAutoEncode {
         net.2.2.0.p = 0.1;
         // net.1.3.p = 0.2;
         Self {optim: Adam::new(&net, AdamConfig{
-            lr: 0.001,
-            betas: [0.99, 0.9999],
+            lr: 0.0001,
+            betas: [0.995, 0.99995],
             ..Default::default()
         }), net}
     }
