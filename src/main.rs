@@ -2,8 +2,9 @@
 
 use std::{thread, time::Duration, ops::{Div, Mul}};
 
+use arena::{GrayImage, join_channel};
 use clap::Parser;
-use net::to_rb;
+use net::{to_rb, from_pixels};
 use rand::{seq::SliceRandom, thread_rng};
 
 //use coaster::{Backend, Cuda, frameworks::cuda::get_cuda_backend};
@@ -16,6 +17,8 @@ mod net;
 enum Mode {
     Eval,
     Train,
+    TrainEncode,
+    EvalEncode,
 }
 
 fn main() {
@@ -24,6 +27,8 @@ fn main() {
     match m {
         Mode::Eval => test_img(),
         Mode::Train => train(),
+        Mode::TrainEncode => train_encode(),
+        Mode::EvalEncode => test_encode(),
     }
     //test_img();
 }
@@ -54,7 +59,11 @@ fn train() {
 
     let mut outp = vec![];
     let mut score = 0;
+
+    let frame_time = 1.0/60.0;
+    let mut frame_el;
     loop {
+        frame_el = std::time::SystemTime::now();
         let img = arena::screenshot(pos);
         let img_pix = net::to_pixels(&img);
 
@@ -87,6 +96,9 @@ fn train() {
         //outp.push(res);
         
         //eprint!("{:?}         \\r", arena::get_score(&img, &num_list[..]));
+        while frame_el.elapsed().unwrap().as_secs_f32() < frame_time {
+            thread::sleep(Duration::from_secs_f32(frame_time)-frame_el.elapsed().unwrap())
+        }
     }
     dbg!(start.elapsed().unwrap());
 
@@ -147,6 +159,7 @@ fn train() {
 
         if !acc_err.is_nan() && acc_err.is_finite() {
             net.save("ai-file/th2_critic.net").unwrap();
+            test_img()
         }
         else {
             eprintln!("Get [NaN|inf]ed lol.");
@@ -182,7 +195,7 @@ fn test_img() {
     let t = conv.iter().map(|x| x.iter().map(|x| x.abs()).sum::<f32>()/s).collect::<Vec<_>>();
     eprintln!("weight: {:?}", t);
     conv.into_iter().enumerate()
-    .map(|(i,p)| (to_rb(&p, (76, 46), true), i))
+    .map(|(i,p)| (to_rb(&p, (39, 24), true), i))
     .for_each(|(x, i)| x.save(format!("images/post_conv{i}.png")).unwrap());
     let score = net.forward(&to_run_pix, &[1.0,0.0,0.0,1.0,0.0,0.0]);
     eprintln!("Score: {score:?}");
@@ -195,7 +208,7 @@ fn test_img() {
     let t = conv.iter().map(|x| x.iter().map(|x| x.abs()).sum::<f32>()/s).collect::<Vec<_>>();
     eprintln!("weight: {:?}", t);
     conv.into_iter().enumerate()
-    .map(|(i,p)| (to_rb(&p, (76, 46), true), i))
+    .map(|(i,p)| (to_rb(&p, (39,24), true), i))
     .for_each(|(x, i)| x.save(format!("images/post_conv{i}_2.png")).unwrap());
     let score = net.forward(&to_run_pix, &[1.0,0.0,0.0,1.0,0.0,0.0]);
     eprintln!("Score: {score:?}");
@@ -216,4 +229,130 @@ fn does_permute() {
     permute(&mut v1, &perm);
     permute(&mut v2, &perm);
     assert_eq!(&v1, &v2);
+}
+
+fn train_encode() {
+
+    eprintln!("Open the game within 2 seconds of starting this.");
+    thread::sleep(Duration::from_millis(2000));
+
+    let pos = arena::get_active_window_pos();
+
+    eprintln!("{pos:?}");
+    
+    let num_list = arena::get_nums();
+
+    let ss = arena::screenshot(pos);
+    ss.save("images/test_ss.bmp").unwrap();
+
+    eprintln!("making net");
+    let mut net = net::NetAutoEncode::load_or_new("ai-file/th2_encode.net"); //::<Backend<Cuda>>
+    eprintln!("Initializing");
+
+    arena::start(pos, &num_list);
+
+    eprintln!("Start playing now");
+
+    let start = std::time::SystemTime::now();
+
+    let mut outp = vec![];
+
+    let frame_time = 1.0/60.0;
+    let mut frame_el;
+    loop {
+        frame_el = std::time::SystemTime::now();
+        let img = arena::screenshot(pos);
+        let img_pix = net::to_pixels(&img);
+
+        outp.push(img_pix);
+
+        // TEST
+        if outp.len() > 7000 {
+            break;
+        }
+
+        while frame_el.elapsed().unwrap().as_secs_f32() < frame_time {
+            thread::sleep(Duration::from_secs_f32(frame_time).saturating_sub(frame_el.elapsed().unwrap()))
+        }
+    }
+    dbg!(start.elapsed().unwrap());
+
+    let mut acc_err = 1.0;
+    let mut epoch = 0;
+    let target_err = 0.03f32.powi(2);
+
+    let mut grad = net.grad();
+    let mut derr;
+
+    const BATCH: usize = 1;
+
+    let mut r = thread_rng();
+    let mut perm = (0..outp.len()).collect::<Vec<_>>();
+
+    while acc_err > target_err {
+        perm.shuffle(&mut r);
+
+        permute(&mut outp, &perm);
+
+        let epoch_start = std::time::SystemTime::now();
+
+        acc_err = 0.0;
+
+        let samples = outp.len()/BATCH;
+
+        for (i, img) in outp.chunks_exact(BATCH).enumerate() {
+            let img = img.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
+            (derr, grad) = net.train_grad::<BATCH>(&img, grad);
+            acc_err += derr;
+            let est_remain = epoch_start.elapsed().unwrap().div((i+1) as u32).mul((samples - i-1) as u32);
+            eprint!("{}/{samples} Err: {} Remaining: {:?}    \r",i+1, acc_err/(i+1) as f32, est_remain);
+        }
+        //grad = net.backward(grad);
+        acc_err /= samples as f32;
+        epoch += 1;
+        eprintln!("Epoch:{epoch} Error: {acc_err}                            ");
+
+        if !acc_err.is_nan() && acc_err.is_finite() && epoch%1 == 0 {
+            net.save("ai-file/th2_encode.net").unwrap();
+            test_encode();
+        }
+        else if acc_err.is_nan() || acc_err.is_infinite() {
+            eprintln!("Get [NaN|inf]ed lol.");
+            break;
+        }
+    }
+
+    if !acc_err.is_nan() && acc_err.is_finite() {
+        net.save("ai-file/th2_encode.net").unwrap();
+    }
+    
+    //eprintln!("{:?}", start.elapsed());
+
+    //eprintln!("{:?}", arena::get_score(images.last().unwrap(), &num_list[..]));
+    //fs::write("win_ss.bmp", images.last().unwrap().buffer()).unwrap();
+}
+
+fn test_encode() {
+
+    let to_run = image::open("images/test img.png").unwrap().to_rgb8();
+    let to_run_pix = net::to_pixels(&to_run);
+    let c = 640*400;
+    let mut ins = [GrayImage::default(), GrayImage::default(), GrayImage::default()];
+    ins[0] = from_pixels(&&to_run_pix[0..c], (640, 400));
+    ins[1] = from_pixels(&&to_run_pix[c..2*c], (640, 400));
+    ins[2] = from_pixels(&&to_run_pix[2*c..], (640, 400));
+    join_channel(&ins).save("images/as_input.png").unwrap();
+    //eprintln!("{:?}", to_run_pix);
+    //eprintln!("making net");
+    let net = net::NetAutoEncode::load_or_new("ai-file/th2_encode.net"); //::<Backend<Cuda>>
+    //eprintln!("Loaded");
+    let conv = net.forward(&to_run_pix);
+    //eprintln!("Ran network");
+    let mut grays : [GrayImage; 3] = [GrayImage::default(), GrayImage::default(), GrayImage::default()];
+    grays[0] = from_pixels(&conv[0], (640, 400));
+    grays[1] = from_pixels(&conv[1], (640, 400));
+    grays[2] = from_pixels(&conv[2], (640, 400));
+    
+    join_channel(&grays).save("images/encoded.png").unwrap()
+
 }

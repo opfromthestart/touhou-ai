@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use device_query::Keycode;
 use enigo::{KeyboardControllable, Key};
-use image::{ImageBuffer, Rgb, Luma, GenericImageView, EncodableLayout};
+use image::{ImageBuffer, Rgb, Luma, GenericImageView};
 
 pub(crate) type Image = ImageBuffer<Rgb<u8>, Vec<u8>>; 
 pub(crate) type GrayImage = ImageBuffer<Luma<u8>, Vec<u8>>;
@@ -89,6 +89,15 @@ pub(crate) fn split_channel(img: &Image) -> [GrayImage; 3] {
     let [r,g,b] = &mut ret;
     for (((p, r), g), b) in img.pixels().zip(r.iter_mut()).zip(g.iter_mut()).zip(b.iter_mut()) {
         [*r, *g, *b] = p.0;
+    }
+    ret
+}
+
+pub(crate) fn join_channel(img: &[GrayImage; 3]) -> Image {
+    let mut ret: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(img[0].width(), img[0].height());
+    let [r,g,b] = &img;
+    for (((p, r), g), b) in ret.pixels_mut().zip(r.iter()).zip(g.iter()).zip(b.iter()) {
+        p.0 = [*r, *g, *b];
     }
     ret
 }

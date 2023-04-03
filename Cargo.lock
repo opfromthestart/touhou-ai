@@ -234,9 +234,9 @@ checksum = "7a81dae078cea95a014a339291cec439d2f232ebe854a9d672b796c6afafa9b7"
 
 [[package]]
 name = "cudarc"
-version = "0.9.1"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c733b8c19afbbff207212cfd8935b82363825996026dd66d1b7ce7eeec76e6d"
+checksum = "637fe0403a6bca09c7079c032027cfe7520fff3b6c22f16f948b2263ece88a57"
 
 [[package]]
 name = "dbus"
