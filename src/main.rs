@@ -236,7 +236,7 @@ fn does_permute() {
 }
 
 fn train_encode() {
-    let datasize = 4000;
+    let datasize = 6000;
 
     eprintln!("making net");
     let mut net = net::NetAutoEncode::load_or_new("ai-file/th2_encode.net"); //::<Backend<Cuda>>
@@ -282,6 +282,7 @@ fn train_encode() {
             eprintln!("Get [NaN|inf]ed lol.");
             break;
         }
+        outp.clear();
     }
 
     if !acc_err.is_nan() && acc_err.is_finite() {
