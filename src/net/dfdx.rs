@@ -1,6 +1,6 @@
 use std::{path::Path, io::Read};
 
-use dfdx::{prelude::{LoadFromNpz, SaveToNpz, ModuleMut, DeviceBuildExt, Conv2D, BuildOnDevice, Linear, ResetParams, ZeroGrads, mse_loss, MaxPool2D, Module, Dropout, Upscale2D, Flatten2D, AvgPool2D, GeneralizedResidual, ConvTrans2D}, tensor::{TensorFromVec, Tensor, Gradients, Trace, Cuda, NoneTape, OwnedTape, AsArray}, shapes::{Const, Rank2, Rank4}, tensor_ops::{ReshapeTo, TryConcat, PermuteTo, Backward, Bilinear}, optim::{Optimizer, Adam, AdamConfig}};
+use dfdx::{prelude::{LoadFromNpz, SaveToNpz, ModuleMut, DeviceBuildExt, Conv2D, BuildOnDevice, Linear, ResetParams, ZeroGrads, mse_loss, MaxPool2D, Module, Dropout, Upscale2D, Flatten2D, AvgPool2D, GeneralizedResidual, ConvTrans2D, Tanh}, tensor::{TensorFromVec, Tensor, Gradients, Trace, Cuda, NoneTape, OwnedTape, AsArray}, shapes::{Const, Rank2, Rank4}, tensor_ops::{ReshapeTo, TryConcat, PermuteTo, Backward, Bilinear}, optim::{Optimizer, Adam, AdamConfig, RMSprop, RMSpropConfig}};
 use dfdx::prelude::Bias2D;
 
 use dfdx::prelude::PReLU;
@@ -11,25 +11,24 @@ use crate::arena;
 type NetDevice = Cuda;
 
 type NetConvCRes = (
-    AvgPool2D<4,4,0>,
     (
         Dropout,
         GeneralizedResidual<(
-            Conv2D<3, 64, 3, 1, 1>,
+            Conv2D<3, 64, 3, 1, 2>,
             Bias2D<64>,
             PReLU1D<Const<64>>,
-            MaxPool2D<2,2,0>,
+            MaxPool2D<3,3,0>,
         ), 
-        Conv2D<3, 64, 1, 2, 0>>,
+        Conv2D<3, 64, 1, 3, 0>>,
     ),
     (
         Dropout,
         GeneralizedResidual<(
-        Conv2D<64, 128, 3, 1, 1>,
+        Conv2D<64, 128, 3, 1, 2>,
         Bias2D<128>,
         PReLU1D<Const<128>>,
-        MaxPool2D<2,2,0>,
-    ), Conv2D<64, 128, 1, 2, 0>>,
+        MaxPool2D<3,3,0>,
+    ), Conv2D<64, 128, 1, 3, 0>>,
 ),
     (
         Dropout,
@@ -41,15 +40,20 @@ type NetConvCRes = (
     ), Conv2D<128, 20, 1, 3, 0>>,),
     Dropout,
 );
+type NetConvSimp = (
+    Conv2D<3, 20, 3, 1, 1>,
+    Bias2D<20>,
+    PReLU1D<Const<20>>,
+    MaxPool2D<44,44,0>,
+);
 type NetConvCN = (
-    AvgPool2D<4,4,0>,
     (
         Dropout,
         (
             Conv2D<3, 64, 3, 1, 1>,
             Bias2D<64>,
             PReLU1D<Const<64>>,
-            MaxPool2D<2,2,0>,
+            MaxPool2D<3,3,0>,
         ), 
     ),
     (
@@ -58,7 +62,7 @@ type NetConvCN = (
         Conv2D<64, 128, 3, 1, 1>,
         Bias2D<128>,
         PReLU1D<Const<128>>,
-        MaxPool2D<2,2,0>,
+        MaxPool2D<3,3,0>,
     ),
 ),
     (
@@ -72,87 +76,109 @@ type NetConvCN = (
     ),
     Dropout,
 );
+type NetConvCN_1 = (
+        Conv2D<3, 64, 3, 1, 1>,
+        Bias2D<64>,
+        PReLU1D<Const<64>>,
+        MaxPool2D<2,2,0>,
+);
 type NetConvLin = (
     Flatten2D,
-    Linear<2520, 128>,
+    Linear<7200, 256>,
     PReLU,
 );
-type NetConv = (
-    NetConvCRes,
-    NetConvLin,
-);
-type NetConvTransLin = (Linear<128, 128>, PReLU, Linear<128, 3600>, PReLU);
+type NetConv = (NetConvCN, NetConvLin);
+type NetConvTransLin = (Linear<256, 7200>, PReLU);
 type NetConvTransCRes = (
     (
         Dropout,
         GeneralizedResidual<(
-        ConvTrans2D<20, 128, 4, 2, 1>,
+        ConvTrans2D<20, 128, 7, 3, 1>,
         Bias2D<128>,
         PReLU1D<Const<128>>,), 
-        ConvTrans2D<20, 128, 2, 2, 0>>,
+        ConvTrans2D<20, 128, 3, 3, 0>>,
     ),
     (
         Dropout,
         GeneralizedResidual<(
-        ConvTrans2D<128, 64, 4, 2, 1>,
+        ConvTrans2D<128, 64, 7, 3, 1>,
         Bias2D<64>,
         PReLU1D<Const<64>>,),
-        ConvTrans2D<128, 64, 2, 2, 0>>,
+        ConvTrans2D<128, 64, 3, 3, 0>>,
     ),
     (
         Dropout,
         GeneralizedResidual<(
-        ConvTrans2D<64, 3, 4, 2, 1>,
+        ConvTrans2D<64, 3, 7, 3, 1>,
         Bias2D<3>,
         PReLU1D<Const<3>>,),
-        ConvTrans2D<64, 3, 2, 2, 0>>,
+        ConvTrans2D<64, 3, 3, 3, 0>>,
     ),
-    ConvTrans2D<3, 3, 4, 4, 0>,
-    Upscale2D<640, 400, Bilinear>,
+    (Upscale2D<640, 400, Bilinear>,
+    Conv2D<3,3,5,1,2>,
+    Bias2D<3>,
+    PReLU,)
+);
+type NetConvTransSimp = (
+    Upscale2D<640, 400>,
+    Conv2D<20,3,5,1,2>,
+    Bias2D<3>,
+    PReLU,
 );
 type NetConvTransCN = (
     (
         Dropout,
         (
-        ConvTrans2D<20, 128, 3, 2, 1>,
+        ConvTrans2D<20, 128, 5, 3, 2>,
         Bias2D<128>,
         PReLU1D<Const<128>>,),
     ),
     (
         Dropout,
         (
-        ConvTrans2D<128, 64, 3, 2, 1>,
+        ConvTrans2D<128, 64, 5, 3, 1>,
         Bias2D<64>,
         PReLU1D<Const<64>>,),
     ),
     (
         Dropout,
         (
-        ConvTrans2D<64, 3, 3, 2, 1>,
+        ConvTrans2D<64, 3, 5, 3, 1>,
         Bias2D<3>,
         PReLU1D<Const<3>>,),
     ),
-    ConvTrans2D<3, 3, 4, 4, 0>,
-    Upscale2D<640, 400, Bilinear>,
+    (   Upscale2D<640, 400, Bilinear>,
+        Conv2D<3,3,5,1,2>,
+        Bias2D<3>,
+        PReLU,)
 );
-type NetConvTransC = NetConvTransCRes;
+type NetConvTransCN_1 = (
+        Dropout,
+        (
+        ConvTrans2D<64, 3, 3, 2, 1>,
+        Bias2D<3>,
+        PReLU1D<Const<3>>,),
+        Upscale2D<640, 400, Bilinear>,
+);
+type NetConvTransC = NetConvTransCN;
+type NetConvTrans = (NetConvTransLin, NetConvTransC);
 type NetLinCrit = (
     (
-    Linear<134, 128>,
+    Linear<262, 256>,
     Dropout,
     PReLU,
     ),
     (
-    Linear<128, 128>,
+    Linear<256, 256>,
     Dropout,
     PReLU,
     ),
-    Linear<128, 1>,
+    Linear<256, 1>,
 );
 
 pub(crate) struct NetAutoEncode {
-    net: <(NetConv, NetConvTransLin, NetConvTransC) as BuildOnDevice<NetDevice, f32>>::Built,
-    optim: Adam<<(NetConv, NetConvTransLin, NetConvTransC) as BuildOnDevice<NetDevice, f32>>::Built, f32, NetDevice>,
+    net: <(NetConv, NetConvTrans) as BuildOnDevice<NetDevice, f32>>::Built,
+    optim: Adam<<(NetConv, NetConvTrans) as BuildOnDevice<NetDevice, f32>>::Built, f32, NetDevice>,
 }
 
 pub(crate) struct NetCrit {
@@ -171,17 +197,16 @@ impl NetCrit {
             eprintln!("Made new, {res:?}");
             net.reset_params();
         }
-        net.0.0.1.0.p = 0.2;
-        net.0.0.2.0.p = 0.2;
-        net.0.0.3.0.p = 0.2;
-        net.0.0.4.p = 0.2;
+        // net.0.0.1.0.p = 0.2;
+        // net.0.0.2.0.p = 0.2;
+        // net.0.0.3.0.p = 0.2;
+        // net.0.0.4.p = 0.2;
         net.1.0.1.p = 0.2;
         net.1.1.1.p = 0.2;
         // net.1.3.p = 0.2;
         Self {
         optim: Adam::new(&net.1, AdamConfig{
-            lr: 0.001,
-            betas: [0.9, 0.999],
+            lr: 0.0001,
             ..Default::default()
         }), net
         }
@@ -190,7 +215,7 @@ impl NetCrit {
     pub(crate) fn load_from_encode<P: AsRef<Path>>(p: P, enc_p: P) -> Self {
         let dev = NetDevice::default();
 
-        let mut net_enc = dev.build_module::<(NetConv, NetConvTransLin, NetConvTransC), f32>();
+        let mut net_enc = dev.build_module::<(NetConv, NetConvTrans), f32>();
         let res_enc = net_enc.load(enc_p.as_ref());
         let mut net = dev.build_module::<(NetConv, NetLinCrit), _>();
         let res_lin = net.load(p.as_ref());
@@ -200,16 +225,15 @@ impl NetCrit {
             eprintln!("Made new, {res_enc:?} {res_lin:?}");
             net.reset_params();
         }
-        net.0.0.1.0.p = 0.2;
-        net.0.0.2.0.p = 0.2;
-        net.0.0.3.0.p = 0.2;
-        net.0.0.4.p = 0.2;
+        // net.0.0.1.0.p = 0.2;
+        // net.0.0.2.0.p = 0.2;
+        // net.0.0.3.0.p = 0.2;
+        // net.0.0.4.p = 0.2;
         net.1.0.1.p = 0.2;
         net.1.1.1.p = 0.2;
         Self {
         optim: Adam::new(&net.1, AdamConfig{
-            lr: 0.001,
-            betas: [0.9, 0.999],
+            lr: 0.0001,
             ..Default::default()
         }), net
         }
@@ -232,18 +256,18 @@ impl NetCrit {
 
     fn forward_raw<const BATCH: usize>(&self, img: Tensor<Rank4<BATCH,3,640,400>, f32, NetDevice, NoneTape>, keys: Tensor<Rank2<BATCH,6>, f32, NetDevice, NoneTape>) -> Tensor<Rank2<BATCH,1>, f32, NetDevice, NoneTape> {
         let out_conv = self.net.0.forward(img);
-        let in_conv : Tensor<(Const::<128>, Const::<BATCH>), _, _, _> = out_conv.reshape();
-        let in_lin = in_conv.concat(keys.reshape::<(Const::<6>, Const::<BATCH>)>()).permute::<Rank2<BATCH, 134>,_>();
+        let in_conv : Tensor<(Const::<256>, Const::<BATCH>), _, _, _> = out_conv.reshape();
+        let in_lin = in_conv.concat(keys.reshape::<(Const::<6>, Const::<BATCH>)>()).permute::<Rank2<BATCH, 262>,_>();
         let out = self.net.1.forward(in_lin);
         out
     }
 
     fn forward_raw_mut<const BATCH: usize>(&mut self, img: Tensor<Rank4<BATCH,3,640,400>, f32, NetDevice, OwnedTape<f32, NetDevice>>, keys: Tensor<Rank2<BATCH,6>, f32, NetDevice, NoneTape>) -> Tensor<Rank2<BATCH,1>, f32, NetDevice, OwnedTape<f32, NetDevice>> {
         let out_conv = self.net.0.forward_mut(img);
-        let in_conv : Tensor<(Const::<BATCH>,Const::<128>), _, _, _> = out_conv.reshape();
-        let in_conv : Tensor<(Const::<128>,Const::<BATCH>), _, _, _> = in_conv.permute().reshape();
+        let in_conv : Tensor<(Const::<BATCH>,Const::<256>), _, _, _> = out_conv.reshape();
+        let in_conv : Tensor<(Const::<256>,Const::<BATCH>), _, _, _> = in_conv.permute().reshape();
         let keys : Tensor<(Const::<6>, Const::<BATCH>), _, _, _> = keys.permute().reshape();
-        let in_lin = in_conv.concat(keys).permute::<Rank2<BATCH, 134>,_>();
+        let in_lin = in_conv.concat(keys).permute::<Rank2<BATCH, 262>,_>();
         let out = self.net.1.forward_mut(in_lin);
         out
     }
@@ -343,24 +367,23 @@ impl NetAutoEncode {
     pub(crate) fn load_or_new<P: AsRef<Path>>(p: P) -> Self {
         let dev = NetDevice::default();
 
-        let mut net = dev.build_module::<(NetConv, NetConvTransLin, NetConvTransC), f32>();
+        let mut net = dev.build_module::<(NetConv, NetConvTrans), f32>();
         let res = net.load(p.as_ref());
         let loaded = res.is_ok();
         if !loaded {
             eprintln!("Made new, {res:?}");
             net.reset_params();
         }
-        net.0.0.1.0.p = 0.1;
-        net.0.0.2.0.p = 0.1;
-        net.0.0.3.0.p = 0.1;
-        net.0.0.4.p = 0.1;
-        net.2.0.0.p = 0.1;
-        net.2.1.0.p = 0.1;
-        net.2.2.0.p = 0.1;
-        // net.1.3.p = 0.2;
+        // net.0.0.1.0.p = 0.1;
+        // net.0.0.2.0.p = 0.1;
+        // net.0.0.3.0.p = 0.1;
+        // net.0.0.4.p = 0.1;
+        // net.2.0.0.p = 0.1;
+        // net.2.1.0.p = 0.1;
+        // net.2.2.0.p = 0.1;
         Self {optim: Adam::new(&net, AdamConfig{
-            lr: 0.0001,
-            betas: [0.995, 0.99995],
+            lr: 0.001,
+            betas: [0.9, 0.999],
             ..Default::default()
         }), net}
     }
@@ -390,15 +413,16 @@ impl NetAutoEncode {
 
     fn forward_raw<const BATCH: usize>(&self, img: Tensor<Rank4<BATCH,3,640,400>, f32, NetDevice, NoneTape>) -> Tensor<Rank4<BATCH,3,640,400>, f32, NetDevice, NoneTape> {
         let out_conv = self.net.0.forward(img);
-        let out_lin = self.net.1.forward(out_conv).reshape::<Rank4<BATCH, 20, 18, 10>>();
-        let out = self.net.2.forward(out_lin);
+        let out_lin = self.net.1.0.forward(out_conv).reshape::<Rank4<BATCH, 20, 24, 15>>();
+        let out = self.net.1.1.forward(out_lin);
         out
     }
 
     fn forward_raw_mut<const BATCH: usize>(&mut self, img: Tensor<Rank4<BATCH,3,640,400>, f32, NetDevice, OwnedTape<f32, NetDevice>>) -> Tensor<Rank4<BATCH,3,640,400>, f32, NetDevice, OwnedTape<f32, NetDevice>> {
-        let out_conv = self.net.0.forward_mut(img);
-        let out_lin = self.net.1.forward_mut(out_conv).reshape::<Rank4<BATCH, 20, 18, 10>>();
-        let out = self.net.2.forward_mut(out_lin);
+        let out_conv = self.net.0.0.forward_mut(img);
+        let out_conv = self.net.0.1.forward_mut(out_conv);
+        let out_lin = self.net.1.0.forward_mut(out_conv).reshape::<Rank4<BATCH, 20, 24, 15>>();
+        let out = self.net.1.1.forward_mut(out_lin);
         out
     }
 

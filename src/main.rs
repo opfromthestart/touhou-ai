@@ -5,7 +5,7 @@ use std::{thread, time::Duration, ops::{Div, Mul}};
 use arena::{GrayImage, join_channel};
 use clap::Parser;
 use net::{to_rb, from_pixels};
-use rand::{seq::SliceRandom, thread_rng, RngCore};
+use rand::{seq::SliceRandom, thread_rng, RngCore, rngs::mock::StepRng};
 
 use crate::arena::{wants_exit, Image, get_enc_batch};
 
@@ -236,7 +236,7 @@ fn does_permute() {
 }
 
 fn train_encode() {
-    let datasize = 6000;
+    let datasize = 800;
 
     eprintln!("making net");
     let mut net = net::NetAutoEncode::load_or_new("ai-file/th2_encode.net"); //::<Backend<Cuda>>
@@ -252,9 +252,13 @@ fn train_encode() {
 
     let mut outp: Vec<Vec<f32>>;
 
+    let mut r = thread_rng();
+
+    // outp = [image::open("dbg_images/test img.png")].map(|x| net::to_pixels(&x.unwrap().to_rgb8())).to_vec();
+
     while acc_err > target_err {
         eprint!("Loading images\r");
-        outp = get_enc_batch(datasize).into_iter().map(|x| net::to_pixels(&x)).collect();
+        outp = get_enc_batch(datasize, &mut r).into_iter().map(|x| net::to_pixels(&x)).collect();
 
         let epoch_start = std::time::SystemTime::now();
 
@@ -297,7 +301,11 @@ fn train_encode() {
 
 fn test_encode() {
 
-    let to_run = image::open("dbg_images/test img.png").unwrap().to_rgb8();
+    let Ok(to_run) = image::open("dbg_images/test img.png") else {
+        println!("debug images not found, make an image dbg_images/test img.png");
+        return;
+    };
+    let to_run = to_run.into_rgb8();
     let to_run_pix = net::to_pixels(&to_run);
     let c = 640*400;
     let mut ins = [GrayImage::default(), GrayImage::default(), GrayImage::default()];

@@ -5,7 +5,7 @@ use std::{ops::Range, fs};
 use device_query::Keycode;
 use enigo::{KeyboardControllable, Key};
 use image::{ImageBuffer, Rgb, Luma, GenericImageView};
-use rand::{thread_rng, seq::SliceRandom};
+use rand::{thread_rng, seq::SliceRandom, Rng};
 
 pub(crate) type Image = ImageBuffer<Rgb<u8>, Vec<u8>>; 
 pub(crate) type GrayImage = ImageBuffer<Luma<u8>, Vec<u8>>;
@@ -322,8 +322,7 @@ pub(crate) fn reset(pos: (i32, i32), nums: &[Image]) {
     start(pos, nums);
 }
 
-pub(crate) fn get_enc_batch(n: usize) -> Vec<Image> {
-    let mut r = thread_rng();
+pub(crate) fn get_enc_batch<R: Rng>(n: usize, r: &mut R) -> Vec<Image> {
     let files = fs::read_dir("images/encoder_data").unwrap();
     let to_ret : Vec<_> = files.filter_map(|x| {
         let y = x.unwrap();
@@ -334,5 +333,5 @@ pub(crate) fn get_enc_batch(n: usize) -> Vec<Image> {
             None
         }
     }).collect();
-    to_ret.choose_multiple(&mut r, n).into_iter().map(|f| image::open(f).unwrap().into_rgb8()).collect()
+    to_ret.choose_multiple(r, n).into_iter().map(|f| image::open(f).unwrap().into_rgb8()).collect()
 }
