@@ -1,6 +1,6 @@
 use std::{path::Path, io::Read};
 
-use dfdx::{prelude::{LoadFromNpz, SaveToNpz, ModuleMut, DeviceBuildExt, Conv2D, BuildOnDevice, Linear, ResetParams, ZeroGrads, mse_loss, MaxPool2D, Module, Dropout, Upscale2D, Flatten2D, AvgPool2D, GeneralizedResidual, ConvTrans2D, Tanh}, tensor::{TensorFromVec, Tensor, Gradients, Trace, Cuda, NoneTape, OwnedTape, AsArray}, shapes::{Const, Rank2, Rank4}, tensor_ops::{ReshapeTo, TryConcat, PermuteTo, Backward, Bilinear}, optim::{Optimizer, Adam, AdamConfig, RMSprop, RMSpropConfig}};
+use dfdx::{prelude::{LoadFromNpz, SaveToNpz, ModuleMut, DeviceBuildExt, Conv2D, BuildOnDevice, Linear, ResetParams, ZeroGrads, mse_loss, MaxPool2D, Module, Dropout, Upscale2D, Flatten2D, AvgPool2D, GeneralizedResidual, ConvTrans2D, Tanh, Upscale2DBy}, tensor::{TensorFromVec, Tensor, Gradients, Trace, Cuda, NoneTape, OwnedTape, AsArray}, shapes::{Const, Rank2, Rank4}, tensor_ops::{ReshapeTo, TryConcat, PermuteTo, Backward, Bilinear}, optim::{Optimizer, Adam, AdamConfig, RMSprop, RMSpropConfig}};
 use dfdx::prelude::Bias2D;
 
 use dfdx::prelude::PReLU;
@@ -10,155 +10,90 @@ use crate::arena;
 
 type NetDevice = Cuda;
 
-type NetConvCRes = (
-    (
-        Dropout,
-        GeneralizedResidual<(
-            Conv2D<3, 64, 3, 1, 2>,
-            Bias2D<64>,
-            PReLU1D<Const<64>>,
-            MaxPool2D<3,3,0>,
-        ), 
-        Conv2D<3, 64, 1, 3, 0>>,
-    ),
-    (
-        Dropout,
-        GeneralizedResidual<(
-        Conv2D<64, 128, 3, 1, 2>,
-        Bias2D<128>,
-        PReLU1D<Const<128>>,
-        MaxPool2D<3,3,0>,
-    ), Conv2D<64, 128, 1, 3, 0>>,
-),
-    (
-        Dropout,
-        GeneralizedResidual<(
-        Conv2D<128, 20, 3, 1, 1>,
-        Bias2D<20>,
-        PReLU1D<Const<20>>,
-        MaxPool2D<3,3,1>,
-    ), Conv2D<128, 20, 1, 3, 0>>,),
-    Dropout,
-);
-type NetConvSimp = (
-    Conv2D<3, 20, 3, 1, 1>,
-    Bias2D<20>,
-    PReLU1D<Const<20>>,
-    MaxPool2D<44,44,0>,
-);
 type NetConvCN = (
+    AvgPool2D<4,4,0>,
     (
-        Dropout,
-        (
-            Conv2D<3, 64, 3, 1, 1>,
-            Bias2D<64>,
-            PReLU1D<Const<64>>,
-            MaxPool2D<3,3,0>,
-        ), 
+        // Dropout,
+        Conv2D<3, 32, 3, 1, 1>,
+        Bias2D<32>,
+        PReLU1D<Const<32>>,
+        MaxPool2D<2,2,0>,
     ),
     (
-        Dropout,
-        (
-        Conv2D<64, 128, 3, 1, 1>,
-        Bias2D<128>,
-        PReLU1D<Const<128>>,
-        MaxPool2D<3,3,0>,
-    ),
-),
-    (
-        Dropout,
-        (
-        Conv2D<128, 20, 3, 1, 1>,
-        Bias2D<20>,
-        PReLU1D<Const<20>>,
-        MaxPool2D<3,3,1>,
-        )
-    ),
-    Dropout,
-);
-type NetConvCN_1 = (
-        Conv2D<3, 64, 3, 1, 1>,
+        // Dropout,
+        Conv2D<32, 64, 3, 1, 1>,
         Bias2D<64>,
         PReLU1D<Const<64>>,
         MaxPool2D<2,2,0>,
+),
+(
+    // Dropout,
+    Conv2D<64, 128, 3, 1, 1>,
+    Bias2D<128>,
+    PReLU1D<Const<128>>,
+    MaxPool2D<2,2,0>,
+),
+    (
+        // Dropout,
+        Conv2D<128, 128, 3, 1, 1>,
+        Bias2D<128>,
+        PReLU1D<Const<128>>,
+        MaxPool2D<2,2,1>,
+    ),
+    (
+        // Dropout,
+        Conv2D<128, 128, 3, 1, 1>,
+        Bias2D<128>,
+        PReLU1D<Const<128>>,
+        MaxPool2D<2,2,1>,
+    ),
+    // Dropout,
 );
 type NetConvLin = (
     Flatten2D,
-    Linear<7200, 256>,
+    Linear<3072, 256>,
     PReLU,
 );
 type NetConv = (NetConvCN, NetConvLin);
-type NetConvTransLin = (Linear<256, 7200>, PReLU);
-type NetConvTransCRes = (
-    (
-        Dropout,
-        GeneralizedResidual<(
-        ConvTrans2D<20, 128, 7, 3, 1>,
-        Bias2D<128>,
-        PReLU1D<Const<128>>,), 
-        ConvTrans2D<20, 128, 3, 3, 0>>,
-    ),
-    (
-        Dropout,
-        GeneralizedResidual<(
-        ConvTrans2D<128, 64, 7, 3, 1>,
-        Bias2D<64>,
-        PReLU1D<Const<64>>,),
-        ConvTrans2D<128, 64, 3, 3, 0>>,
-    ),
-    (
-        Dropout,
-        GeneralizedResidual<(
-        ConvTrans2D<64, 3, 7, 3, 1>,
-        Bias2D<3>,
-        PReLU1D<Const<3>>,),
-        ConvTrans2D<64, 3, 3, 3, 0>>,
-    ),
-    (Upscale2D<640, 400, Bilinear>,
-    Conv2D<3,3,5,1,2>,
-    Bias2D<3>,
-    PReLU,)
-);
-type NetConvTransSimp = (
-    Upscale2D<640, 400>,
-    Conv2D<20,3,5,1,2>,
-    Bias2D<3>,
-    PReLU,
-);
+type NetConvTransLin = (Linear<256, 3072>, PReLU);
 type NetConvTransCN = (
     (
-        Dropout,
-        (
-        ConvTrans2D<20, 128, 5, 3, 2>,
+    (
+        // Dropout,
+        ConvTrans2D<128, 128, 3, 2, 2>,
         Bias2D<128>,
-        PReLU1D<Const<128>>,),
+        PReLU1D<Const<128>>,
     ),
     (
-        Dropout,
-        (
-        ConvTrans2D<128, 64, 5, 3, 1>,
+        // Dropout,
+        ConvTrans2D<128, 128, 3, 2, 2>,
+        Bias2D<128>,
+        PReLU1D<Const<128>>,
+    ),
+),
+    (
+        // Dropout,=
+        ConvTrans2D<128, 64, 3, 2, 1>,
         Bias2D<64>,
-        PReLU1D<Const<64>>,),
+        PReLU1D<Const<64>>,
     ),
     (
-        Dropout,
-        (
-        ConvTrans2D<64, 3, 5, 3, 1>,
-        Bias2D<3>,
-        PReLU1D<Const<3>>,),
+        // Dropout,=
+        ConvTrans2D<64, 32, 3, 2, 1>,
+        Bias2D<32>,
+        PReLU1D<Const<32>>,
     ),
-    (   Upscale2D<640, 400, Bilinear>,
+    (
+        // Dropout,
+        ConvTrans2D<32, 3, 3, 2, 1>,
+        Bias2D<3>,
+        PReLU1D<Const<3>>,
+    ),
+    (   Upscale2D<160, 100, Bilinear>,
         Conv2D<3,3,5,1,2>,
         Bias2D<3>,
-        PReLU,)
-);
-type NetConvTransCN_1 = (
-        Dropout,
-        (
-        ConvTrans2D<64, 3, 3, 2, 1>,
-        Bias2D<3>,
-        PReLU1D<Const<3>>,),
-        Upscale2D<640, 400, Bilinear>,
+        PReLU,),
+        Upscale2DBy<4,4,Bilinear>,
 );
 type NetConvTransC = NetConvTransCN;
 type NetConvTrans = (NetConvTransLin, NetConvTransC);
@@ -201,8 +136,8 @@ impl NetCrit {
         // net.0.0.2.0.p = 0.2;
         // net.0.0.3.0.p = 0.2;
         // net.0.0.4.p = 0.2;
-        net.1.0.1.p = 0.2;
-        net.1.1.1.p = 0.2;
+        // net.1.0.1.p = 0.2;
+        // net.1.1.1.p = 0.2;
         // net.1.3.p = 0.2;
         Self {
         optim: Adam::new(&net.1, AdamConfig{
@@ -382,8 +317,8 @@ impl NetAutoEncode {
         // net.2.1.0.p = 0.1;
         // net.2.2.0.p = 0.1;
         Self {optim: Adam::new(&net, AdamConfig{
-            lr: 0.001,
-            betas: [0.9, 0.999],
+            lr: 0.0001,
+            betas: [0.97, 0.999],
             ..Default::default()
         }), net}
     }
@@ -413,7 +348,7 @@ impl NetAutoEncode {
 
     fn forward_raw<const BATCH: usize>(&self, img: Tensor<Rank4<BATCH,3,640,400>, f32, NetDevice, NoneTape>) -> Tensor<Rank4<BATCH,3,640,400>, f32, NetDevice, NoneTape> {
         let out_conv = self.net.0.forward(img);
-        let out_lin = self.net.1.0.forward(out_conv).reshape::<Rank4<BATCH, 20, 24, 15>>();
+        let out_lin = self.net.1.0.forward(out_conv).reshape::<Rank4<BATCH, 128, 6, 4>>();
         let out = self.net.1.1.forward(out_lin);
         out
     }
@@ -421,7 +356,7 @@ impl NetAutoEncode {
     fn forward_raw_mut<const BATCH: usize>(&mut self, img: Tensor<Rank4<BATCH,3,640,400>, f32, NetDevice, OwnedTape<f32, NetDevice>>) -> Tensor<Rank4<BATCH,3,640,400>, f32, NetDevice, OwnedTape<f32, NetDevice>> {
         let out_conv = self.net.0.0.forward_mut(img);
         let out_conv = self.net.0.1.forward_mut(out_conv);
-        let out_lin = self.net.1.0.forward_mut(out_conv).reshape::<Rank4<BATCH, 20, 24, 15>>();
+        let out_lin = self.net.1.0.forward_mut(out_conv).reshape::<Rank4<BATCH, 128, 6, 4>>();
         let out = self.net.1.1.forward_mut(out_lin);
         out
     }
@@ -465,6 +400,9 @@ impl NetAutoEncode {
         
         grad = err.backward();
 
+        // println!("{:?}", grad.get(&self.net.0.0.1.0.weight).as_vec().into_iter().reduce(|x,y| x.abs() + y.abs()));
+        // println!("{:?}", grad.get(&self.net.1.1.3.3.a).as_vec().into_iter().reduce(|x,y| x.abs() + y.abs()));
+
         //dbg!(&grads);
 
         self.optim.update(&mut self.net, &grad).unwrap();
@@ -495,6 +433,8 @@ impl NetAutoEncode {
     }
 
     pub(crate) fn backward(&mut self, mut grad: Gradients<f32, NetDevice>) -> Gradients<f32, NetDevice>{
+        // println!("{:?}", grad.get(&self.net.0.0.1.0.weight).as_vec().into_iter().reduce(|x,y| x.abs() + y.abs()));
+        // println!("{:?}", grad.get(&self.net.1.1.4.3.a).as_vec().into_iter().reduce(|x,y| x.abs() + y.abs()));
         self.optim.update(&mut self.net, &grad).unwrap();
 
         self.net.zero_grads(&mut grad);

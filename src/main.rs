@@ -235,8 +235,13 @@ fn does_permute() {
     assert_eq!(&v1, &v2);
 }
 
+const SINGLE: bool = false;
+
+const MEM_BATCH: usize = if SINGLE {1} else {6};
+const BACK_BATCH: usize = if SINGLE {1} else {64}; // Should be divisible by MEM_BATCH
+
 fn train_encode() {
-    let datasize = 800;
+    let datasize = BACK_BATCH * 16;
 
     eprintln!("making net");
     let mut net = net::NetAutoEncode::load_or_new("ai-file/th2_encode.net"); //::<Backend<Cuda>>
@@ -248,28 +253,34 @@ fn train_encode() {
     let mut grad = net.grad();
     let mut derr;
 
-    const BATCH: usize = 1;
-
-    let mut outp: Vec<Vec<f32>>;
+    let mut outp: Vec<Vec<f32>> = vec![];
 
     let mut r = thread_rng();
 
-    // outp = [image::open("dbg_images/test img.png")].map(|x| net::to_pixels(&x.unwrap().to_rgb8())).to_vec();
+    if SINGLE {
+        outp = [image::open("dbg_images/test img.png")].map(|x| net::to_pixels(&x.unwrap().to_rgb8())).to_vec();
+        println!("{:?}", &outp[0][0..20]);
+    }
 
     while acc_err > target_err {
         eprint!("Loading images\r");
-        outp = get_enc_batch(datasize, &mut r).into_iter().map(|x| net::to_pixels(&x)).collect();
+        if !SINGLE {
+            outp = get_enc_batch(datasize, &mut r).into_iter().map(|x| net::to_pixels(&x)).collect();
+        }
 
         let epoch_start = std::time::SystemTime::now();
 
         acc_err = 0.0;
 
-        let samples = outp.len()/BATCH;
+        let samples = outp.len()/BACK_BATCH;
 
-        for (i, img) in outp.chunks_exact(BATCH).enumerate() {
+        for (i, img) in outp.chunks_exact(BACK_BATCH).enumerate() {
             let img = img.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
-            (derr, grad) = net.train_grad::<BATCH>(&img, grad);
-            acc_err += derr;
+            for imgb in img.chunks_exact(MEM_BATCH) {
+                (derr, grad) = net.acc_grad::<MEM_BATCH>(&imgb, grad);
+                acc_err += derr;
+            }
+            grad = net.backward(grad);
             let est_remain = epoch_start.elapsed().unwrap().div((i+1) as u32).mul((samples - i-1) as u32);
             eprint!("{}/{samples} Err: {} Remaining: {:?}    \r",i+1, acc_err/(i+1) as f32, est_remain);
         }
@@ -286,7 +297,9 @@ fn train_encode() {
             eprintln!("Get [NaN|inf]ed lol.");
             break;
         }
-        outp.clear();
+        if !SINGLE {
+            outp.clear();
+        }
     }
 
     if !acc_err.is_nan() && acc_err.is_finite() {
@@ -312,6 +325,9 @@ fn test_encode() {
     ins[0] = from_pixels(&&to_run_pix[0..c], (640, 400));
     ins[1] = from_pixels(&&to_run_pix[c..2*c], (640, 400));
     ins[2] = from_pixels(&&to_run_pix[2*c..], (640, 400));
+    ins[0].save("dbg_images/as_input_r.png").unwrap();
+    ins[1].save("dbg_images/as_input_g.png").unwrap();
+    ins[2].save("dbg_images/as_input_b.png").unwrap();
     join_channel(&ins).save("dbg_images/as_input.png").unwrap();
     //eprintln!("{:?}", to_run_pix);
     //eprintln!("making net");
