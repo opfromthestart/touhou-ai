@@ -10,9 +10,9 @@ clap = { version = "4.1", features = ["derive"] }
 #bincode = "1.3.3"
 #coaster = {path = "../math/juice/coaster"}
 device_query = "1.1.2" #gets pressed keys
-dfdx = {git = "https://github.com/coreylowman/dfdx", features = ["nightly", "numpy", "cuda"]}
+dfdx = {git = "https://github.com/coreylowman/dfdx.git", branch="main", features = ["nightly", "numpy", "cuda"]}
 enigo = "0.0.14" # presses keys
-image = "0.24.5" # Loads files
+image = "0.24.5" # Loads and saves images
 #juice = {path = "../math/juice/juice"}
 #mushin = "0.5.0"
 #ndarray = "0.15.6"

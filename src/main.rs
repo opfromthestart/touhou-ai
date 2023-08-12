@@ -237,11 +237,11 @@ fn does_permute() {
 
 const SINGLE: bool = false;
 
-const MEM_BATCH: usize = if SINGLE {1} else {6};
-const BACK_BATCH: usize = if SINGLE {1} else {64}; // Should be divisible by MEM_BATCH
+const MEM_BATCH: usize = if SINGLE {1} else {1};
+const BACK_BATCH: usize = if SINGLE {1} else {1}; // Should be divisible by MEM_BATCH
 
 fn train_encode() {
-    let datasize = BACK_BATCH * 16;
+    let datasize = BACK_BATCH * 2048;
 
     eprintln!("making net");
     let mut net = net::NetAutoEncode::load_or_new("ai-file/th2_encode.net"); //::<Backend<Cuda>>
@@ -281,6 +281,7 @@ fn train_encode() {
                 acc_err += derr;
             }
             grad = net.backward(grad);
+            
             let est_remain = epoch_start.elapsed().unwrap().div((i+1) as u32).mul((samples - i-1) as u32);
             eprint!("{}/{samples} Err: {} Remaining: {:?}    \r",i+1, acc_err/(i+1) as f32, est_remain);
         }
