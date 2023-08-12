@@ -1,6 +1,6 @@
 use std::{io::Read, path::Path};
 
-use dfdx::prelude::{Bias2D, ReLU};
+use dfdx::prelude::{Bias2D, ReLU, Sigmoid};
 use dfdx::tensor::Cpu;
 use dfdx::tensor_ops::NearestNeighbor;
 use dfdx::{
@@ -114,14 +114,39 @@ type NetLinCrit = (
 );
 
 type NetEncodePy = (
-    (Conv2D<3, 64, 3, 1, 1>, ReLU, MaxPool2D<2, 2, 0>),
-    (Conv2D<64, 16, 3, 1, 1>, ReLU, MaxPool2D<2, 2, 0>),
-    (Conv2D<16, 16, 3, 1, 1>, ReLU, MaxPool2D<2, 2, 0>),
+    (Conv2D<3, 64, 3, 1, 1>, Bias2D<64>, ReLU, MaxPool2D<2, 2, 0>),
+    (
+        Conv2D<64, 16, 3, 1, 1>,
+        Bias2D<16>,
+        ReLU,
+        MaxPool2D<2, 2, 0>,
+    ),
+    (
+        Conv2D<16, 16, 3, 1, 1>,
+        Bias2D<16>,
+        ReLU,
+        MaxPool2D<2, 2, 0>,
+    ),
 );
 type NetDecodePy = (
-    (Upscale2DBy<2, 2, NearestNeighbor>, Conv2D<16, 16, 3, 1, 1>),
-    (Upscale2DBy<2, 2, NearestNeighbor>, Conv2D<16, 64, 3, 1, 1>),
-    (Upscale2DBy<2, 2, NearestNeighbor>, Conv2D<64, 3, 3, 1, 1>),
+    (
+        Upscale2DBy<2, 2, NearestNeighbor>,
+        Conv2D<16, 16, 3, 1, 1>,
+        Bias2D<16>,
+        ReLU,
+    ),
+    (
+        Upscale2DBy<2, 2, NearestNeighbor>,
+        Conv2D<16, 64, 3, 1, 1>,
+        Bias2D<64>,
+        ReLU,
+    ),
+    (
+        Upscale2DBy<2, 2, NearestNeighbor>,
+        Conv2D<64, 3, 3, 1, 1>,
+        Bias2D<3>,
+        Sigmoid,
+    ),
 );
 type NetAutoModel = (NetEncodePy, NetDecodePy);
 type NetCritModel = (NetConv, NetLinCrit);
@@ -397,7 +422,7 @@ impl NetAutoEncode {
                 &net,
                 AdamConfig {
                     lr: 0.0001,
-                    betas: [0.99, 0.999],
+                    betas: [0.9, 0.999],
                     ..Default::default()
                 },
             ),
@@ -581,7 +606,7 @@ pub(crate) fn to_pixels(img: &arena::Image) -> Vec<f32> {
         .into_iter()
         .map(|x| {
             x.bytes()
-                .map(|x| (x.unwrap() as f32) / 128. - 1.0)
+                .map(|x| (x.unwrap() as f32) / 255.)
                 .collect::<Vec<_>>()
         })
         .flatten()
@@ -589,7 +614,7 @@ pub(crate) fn to_pixels(img: &arena::Image) -> Vec<f32> {
 }
 
 pub(crate) fn from_pixels(img: &[f32], shape: (u32, u32)) -> arena::GrayImage {
-    let img_data: Vec<_> = img.iter().map(|x| ((x + 1.0) * 128.) as u8).collect();
+    let img_data: Vec<_> = img.iter().map(|x| ((x) * 255.) as u8).collect();
     arena::GrayImage::from_vec(shape.0, shape.1, img_data).unwrap()
 }
 

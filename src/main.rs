@@ -1,13 +1,17 @@
 #![feature(generic_const_exprs)]
 
-use std::{thread, time::Duration, ops::{Div, Mul}};
+use std::{
+    ops::{Div, Mul},
+    thread,
+    time::Duration,
+};
 
-use arena::{GrayImage, join_channel};
+use arena::{join_channel, GrayImage};
 use clap::Parser;
-use net::{to_rb, from_pixels};
-use rand::{seq::SliceRandom, thread_rng, RngCore, rngs::mock::StepRng};
+use net::{from_pixels, to_rb};
+use rand::{rngs::mock::StepRng, seq::SliceRandom, thread_rng, RngCore};
 
-use crate::arena::{wants_exit, Image, get_enc_batch};
+use crate::arena::{get_enc_batch, wants_exit, Image};
 
 //use coaster::{Backend, Cuda, frameworks::cuda::get_cuda_backend};
 //use ndarray::Dim;
@@ -31,7 +35,7 @@ fn main() {
         Mode::Eval => test_img(),
         Mode::Train => train(),
         Mode::TrainEncode => train_encode(),
-        Mode::EvalEncode => test_encode(),
+        Mode::EvalEncode => test_encode(None),
         Mode::Gather => gather_encode(),
     }
     //test_img();
@@ -45,7 +49,7 @@ fn train() {
     let pos = arena::get_active_window_pos();
 
     eprintln!("{pos:?}");
-    
+
     let num_list = arena::get_nums();
 
     let ss = arena::screenshot(pos);
@@ -64,7 +68,7 @@ fn train() {
     let mut outp = vec![];
     let mut score = 0;
 
-    let frame_time = 1.0/60.0;
+    let frame_time = 1.0 / 60.0;
     let mut frame_el;
     loop {
         frame_el = std::time::SystemTime::now();
@@ -72,36 +76,33 @@ fn train() {
         let img_pix = net::to_pixels(&img);
 
         //dbg!(&data.as_slice().unwrap()[0..15]);
-        let keys = arena::get_keys().map(|x| if x {
-            1.0
-        }
-        else {
-            0.0
-        }).to_vec();
+        let keys = arena::get_keys()
+            .map(|x| if x { 1.0 } else { 0.0 })
+            .to_vec();
         //let c = get_cuda_backend();
         //dbg!(&res);
         //res.forward();
         let new_score = arena::get_score(&img, &num_list).unwrap_or(score);
-        
+
         //eprintln!("{:?}", new_score);
         let score_d = new_score - score;
         score = new_score;
 
-        outp.push((img_pix, keys, (score_d as f32)/1_000.));
+        outp.push((img_pix, keys, (score_d as f32) / 1_000.));
 
         // TEST
         if outp.len() > 4000 {
             break;
         }
 
-            //let keys = res.iter().map(|x| *x>0.5).collect::<Vec<_>>();
+        //let keys = res.iter().map(|x| *x>0.5).collect::<Vec<_>>();
 
         //arena::do_out(&keys);
         //outp.push(res);
-        
+
         //eprint!("{:?}         \\r", arena::get_score(&img, &num_list[..]));
         while frame_el.elapsed().unwrap().as_secs_f32() < frame_time {
-            thread::sleep(Duration::from_secs_f32(frame_time)-frame_el.elapsed().unwrap())
+            thread::sleep(Duration::from_secs_f32(frame_time) - frame_el.elapsed().unwrap())
         }
     }
     dbg!(start.elapsed().unwrap());
@@ -119,7 +120,7 @@ fn train() {
     let mut out_vec = vec![];
     {
         let mut acc = 0.0;
-        for (img,key,sc) in outp.into_iter().rev() {
+        for (img, key, sc) in outp.into_iter().rev() {
             out_vec.push(acc);
             img_vec.push(img);
             key_vec.push(key.into_iter().map(|x| x as f32).collect::<Vec<_>>());
@@ -144,17 +145,29 @@ fn train() {
 
         acc_err = 0.0;
 
-        let samples = out_vec.len()/BATCH;
+        let samples = out_vec.len() / BATCH;
 
-        for (i, ((img, keys), acc)) in img_vec.chunks_exact(BATCH)
-        .zip(key_vec.chunks_exact(BATCH))
-        .zip(out_vec.chunks_exact(BATCH)).enumerate() {
+        for (i, ((img, keys), acc)) in img_vec
+            .chunks_exact(BATCH)
+            .zip(key_vec.chunks_exact(BATCH))
+            .zip(out_vec.chunks_exact(BATCH))
+            .enumerate()
+        {
             let img = img.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
             let keys = keys.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
             (derr, grad) = net.train_grad::<BATCH>(&img, &keys, &[acc], grad);
             acc_err += derr;
-            let est_remain = epoch_start.elapsed().unwrap().div((i+1) as u32).mul((samples - i-1) as u32);
-            eprint!("{}/{samples} Err: {} Remaining: {:?}    \r",i+1, acc_err/((i+1)*BATCH) as f32, est_remain);
+            let est_remain = epoch_start
+                .elapsed()
+                .unwrap()
+                .div((i + 1) as u32)
+                .mul((samples - i - 1) as u32);
+            eprint!(
+                "{}/{samples} Err: {} Remaining: {:?}    \r",
+                i + 1,
+                acc_err / ((i + 1) * BATCH) as f32,
+                est_remain
+            );
         }
         //grad = net.backward(grad);
         acc_err /= out_vec.len() as f32;
@@ -164,8 +177,7 @@ fn train() {
         if !acc_err.is_nan() && acc_err.is_finite() {
             net.save("ai-file/th2_critic.net").unwrap();
             test_img()
-        }
-        else {
+        } else {
             eprintln!("Get [NaN|inf]ed lol.");
             break;
         }
@@ -174,7 +186,7 @@ fn train() {
     if !acc_err.is_nan() && acc_err.is_finite() {
         net.save("ai-file/th2_critic.net").unwrap();
     }
-    
+
     //eprintln!("{:?}", start.elapsed());
 
     //eprintln!("{:?}", arena::get_score(images.last().unwrap(), &num_list[..]));
@@ -189,19 +201,22 @@ fn permute<T>(v: &mut [T], p: &[usize]) {
 }
 
 fn test_img() {
-
     let to_run = image::open("dbg_images/test img.png").unwrap().to_rgb8();
     let to_run_pix = net::to_pixels(&to_run);
     //eprintln!("{:?}", to_run_pix)eprintln!("making net");
     let net = net::NetCrit::load_or_new("ai-file/th2_critic.net"); //::<Backend<Cuda>>
     let conv = net.do_conv(&to_run_pix);
     let s = conv[0].len() as f32;
-    let t = conv.iter().map(|x| x.iter().map(|x| x.abs()).sum::<f32>()/s).collect::<Vec<_>>();
+    let t = conv
+        .iter()
+        .map(|x| x.iter().map(|x| x.abs()).sum::<f32>() / s)
+        .collect::<Vec<_>>();
     eprintln!("weight: {:?}", t);
-    conv.into_iter().enumerate()
-    .map(|(i,p)| (to_rb(&p, (39, 24), true), i))
-    .for_each(|(x, i)| x.save(format!("dbg_images/post_conv{i}.png")).unwrap());
-    let score = net.forward(&to_run_pix, &[1.0,0.0,0.0,1.0,0.0,0.0]);
+    conv.into_iter()
+        .enumerate()
+        .map(|(i, p)| (to_rb(&p, (39, 24), true), i))
+        .for_each(|(x, i)| x.save(format!("dbg_images/post_conv{i}.png")).unwrap());
+    let score = net.forward(&to_run_pix, &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
     eprintln!("Score: {score:?}");
 
     let to_run = image::open("dbg_images/test img2.png").unwrap().to_rgb8();
@@ -209,12 +224,16 @@ fn test_img() {
     //eprintln!("{:?}", to_run_pix)eprintln!("making net");
     let net = net::NetCrit::load_or_new("ai-file/th2_critic.net"); //::<Backend<Cuda>>
     let conv = net.do_conv(&to_run_pix);
-    let t = conv.iter().map(|x| x.iter().map(|x| x.abs()).sum::<f32>()/s).collect::<Vec<_>>();
+    let t = conv
+        .iter()
+        .map(|x| x.iter().map(|x| x.abs()).sum::<f32>() / s)
+        .collect::<Vec<_>>();
     eprintln!("weight: {:?}", t);
-    conv.into_iter().enumerate()
-    .map(|(i,p)| (to_rb(&p, (39,24), true), i))
-    .for_each(|(x, i)| x.save(format!("dbg_images/post_conv{i}_2.png")).unwrap());
-    let score = net.forward(&to_run_pix, &[1.0,0.0,0.0,1.0,0.0,0.0]);
+    conv.into_iter()
+        .enumerate()
+        .map(|(i, p)| (to_rb(&p, (39, 24), true), i))
+        .for_each(|(x, i)| x.save(format!("dbg_images/post_conv{i}_2.png")).unwrap());
+    let score = net.forward(&to_run_pix, &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
     eprintln!("Score: {score:?}");
 
     // let bytes = std::fs::read("ai-file/1.0.bias").unwrap()[74..].to_vec();
@@ -227,7 +246,7 @@ fn test_img() {
 
 #[test]
 fn does_permute() {
-    let perm = vec![0,2,1,4,3];
+    let perm = vec![0, 2, 1, 4, 3];
     let mut v1 = vec![12, 23, 34, 45, 56];
     let mut v2 = v1.clone();
     permute(&mut v1, &perm);
@@ -237,11 +256,11 @@ fn does_permute() {
 
 const SINGLE: bool = false;
 
-const MEM_BATCH: usize = if SINGLE {1} else {1};
-const BACK_BATCH: usize = if SINGLE {1} else {1}; // Should be divisible by MEM_BATCH
+const MEM_BATCH: usize = if SINGLE { 1 } else { 2 };
+const BACK_BATCH: usize = if SINGLE { 1 } else { 2 }; // Should be divisible by MEM_BATCH
 
 fn train_encode() {
-    let datasize = BACK_BATCH * 2048;
+    let datasize = BACK_BATCH * 1000;
 
     eprintln!("making net");
     let mut net = net::NetAutoEncode::load_or_new("ai-file/th2_encode.net"); //::<Backend<Cuda>>
@@ -258,43 +277,56 @@ fn train_encode() {
     let mut r = thread_rng();
 
     if SINGLE {
-        outp = [image::open("dbg_images/test img.png")].map(|x| net::to_pixels(&x.unwrap().to_rgb8())).to_vec();
+        outp = [image::open("dbg_images/test img.png")]
+            .map(|x| net::to_pixels(&x.unwrap().to_rgb8()))
+            .to_vec();
         println!("{:?}", &outp[0][0..20]);
     }
 
     while acc_err > target_err {
         eprint!("Loading images\r");
         if !SINGLE {
-            outp = get_enc_batch(datasize, &mut r).into_iter().map(|x| net::to_pixels(&x)).collect();
+            outp = get_enc_batch(datasize, &mut r)
+                .into_iter()
+                .map(|x| net::to_pixels(&x))
+                .collect();
         }
 
         let epoch_start = std::time::SystemTime::now();
 
         acc_err = 0.0;
 
-        let samples = outp.len()/BACK_BATCH;
+        let samples = outp.len() / BACK_BATCH;
 
         for (i, img) in outp.chunks_exact(BACK_BATCH).enumerate() {
             let img = img.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
             for imgb in img.chunks_exact(MEM_BATCH) {
                 (derr, grad) = net.acc_grad::<MEM_BATCH>(&imgb, grad);
                 acc_err += derr;
+                grad = net.backward(grad);
             }
-            grad = net.backward(grad);
-            
-            let est_remain = epoch_start.elapsed().unwrap().div((i+1) as u32).mul((samples - i-1) as u32);
-            eprint!("{}/{samples} Err: {} Remaining: {:?}    \r",i+1, acc_err/(i+1) as f32, est_remain);
+
+            let est_remain = epoch_start
+                .elapsed()
+                .unwrap()
+                .div((i + 1) as u32)
+                .mul((samples - i - 1) as u32);
+            eprint!(
+                "{}/{samples} Err: {} Remaining: {:?}    \r",
+                i + 1,
+                acc_err / (i + 1) as f32,
+                est_remain
+            );
         }
         //grad = net.backward(grad);
         acc_err /= samples as f32;
         epoch += 1;
         eprintln!("Epoch:{epoch} Error: {acc_err}                            ");
 
-        if !acc_err.is_nan() && acc_err.is_finite() && epoch%1 == 0 {
+        if !acc_err.is_nan() && acc_err.is_finite() && epoch % 1 == 0 {
             net.save("ai-file/th2_encode.net").unwrap();
-            test_encode();
-        }
-        else if acc_err.is_nan() || acc_err.is_infinite() {
+            test_encode(outp.last().cloned());
+        } else if acc_err.is_nan() || acc_err.is_infinite() {
             eprintln!("Get [NaN|inf]ed lol.");
             break;
         }
@@ -306,26 +338,34 @@ fn train_encode() {
     if !acc_err.is_nan() && acc_err.is_finite() {
         net.save("ai-file/th2_encode.net").unwrap();
     }
-    
+
     //eprintln!("{:?}", start.elapsed());
 
     //eprintln!("{:?}", arena::get_score(images.last().unwrap(), &num_list[..]));
     //fs::write("win_ss.bmp", images.last().unwrap().buffer()).unwrap();
 }
 
-fn test_encode() {
-
-    let Ok(to_run) = image::open("dbg_images/test img.png") else {
-        println!("debug images not found, make an image dbg_images/test img.png");
-        return;
+fn test_encode(pixels: Option<Vec<f32>>) {
+    let to_run_pix = match pixels {
+        Some(p) => p,
+        None => {
+            let Ok(to_run) = image::open("dbg_images/test img.png") else {
+                println!("debug images not found, make an image dbg_images/test img.png");
+                return;
+            };
+            let to_run = to_run.into_rgb8();
+            net::to_pixels(&to_run)
+        }
     };
-    let to_run = to_run.into_rgb8();
-    let to_run_pix = net::to_pixels(&to_run);
-    let c = 640*400;
-    let mut ins = [GrayImage::default(), GrayImage::default(), GrayImage::default()];
+    let c = 640 * 400;
+    let mut ins = [
+        GrayImage::default(),
+        GrayImage::default(),
+        GrayImage::default(),
+    ];
     ins[0] = from_pixels(&&to_run_pix[0..c], (640, 400));
-    ins[1] = from_pixels(&&to_run_pix[c..2*c], (640, 400));
-    ins[2] = from_pixels(&&to_run_pix[2*c..], (640, 400));
+    ins[1] = from_pixels(&&to_run_pix[c..2 * c], (640, 400));
+    ins[2] = from_pixels(&&to_run_pix[2 * c..], (640, 400));
     ins[0].save("dbg_images/as_input_r.png").unwrap();
     ins[1].save("dbg_images/as_input_g.png").unwrap();
     ins[2].save("dbg_images/as_input_b.png").unwrap();
@@ -333,27 +373,45 @@ fn test_encode() {
     //eprintln!("{:?}", to_run_pix);
     //eprintln!("making net");
     let net = net::NetAutoEncode::load_or_new("ai-file/th2_encode.net"); //::<Backend<Cuda>>
-    //eprintln!("Loaded");
+                                                                         //eprintln!("Loaded");
     let conv = net.forward(&to_run_pix);
     //eprintln!("Ran network");
-    let mut grays : [GrayImage; 3] = [GrayImage::default(), GrayImage::default(), GrayImage::default()];
+    let mut grays: [GrayImage; 3] = [
+        GrayImage::default(),
+        GrayImage::default(),
+        GrayImage::default(),
+    ];
     grays[0] = from_pixels(&conv[0], (640, 400));
     grays[1] = from_pixels(&conv[1], (640, 400));
     grays[2] = from_pixels(&conv[2], (640, 400));
-    
-    join_channel(&grays).save("dbg_images/encoded.png").unwrap()
 
+    join_channel(&grays).save("dbg_images/encoded.png").unwrap();
+    println!(
+        "{:?} {:?}",
+        to_run_pix.iter().fold(f32::INFINITY, |a, b| a.min(*b)),
+        to_run_pix
+            .as_slice()
+            .iter()
+            .fold(f32::NEG_INFINITY, |a, b| a.max(*b))
+    );
+    println!(
+        "{:?} {:?}",
+        conv[0].iter().fold(f32::INFINITY, |a, b| a.min(*b)),
+        conv[0]
+            .as_slice()
+            .iter()
+            .fold(f32::NEG_INFINITY, |a, b| a.max(*b))
+    );
 }
 
 fn gather_encode() {
-
     eprintln!("Open the game within 2 seconds of starting this.");
     thread::sleep(Duration::from_millis(2000));
 
     let pos = arena::get_active_window_pos();
 
     eprintln!("{pos:?}");
-    
+
     let num_list = arena::get_nums();
 
     let ss = arena::screenshot(pos);
@@ -367,7 +425,7 @@ fn gather_encode() {
 
     let mut outp = vec![];
 
-    let frame_time = 1.0/60.0;
+    let frame_time = 1.0 / 60.0;
     let mut frame_el;
     loop {
         frame_el = std::time::SystemTime::now();
@@ -381,29 +439,36 @@ fn gather_encode() {
         }
 
         while frame_el.elapsed().unwrap().as_secs_f32() < frame_time {
-            thread::sleep(Duration::from_secs_f32(frame_time).saturating_sub(frame_el.elapsed().unwrap()))
+            thread::sleep(
+                Duration::from_secs_f32(frame_time).saturating_sub(frame_el.elapsed().unwrap()),
+            )
         }
     }
     dbg!(start.elapsed().unwrap());
     let l = outp.len() as f32;
     let mut r = thread_rng();
     for (i, img) in outp.into_iter().enumerate() {
-        img.save(format!("images/encoder_data/{}_{}_{}.png", r.next_u32(), r.next_u32(), r.next_u32())).unwrap();
-        if i%500 == 0 {
-            println!("Got {i} done, {}", i as f32/l);
+        img.save(format!(
+            "images/encoder_data/{}_{}_{}.png",
+            r.next_u32(),
+            r.next_u32(),
+            r.next_u32()
+        ))
+        .unwrap();
+        if i % 500 == 0 {
+            println!("Got {i} done, {}", i as f32 / l);
         }
     }
 }
 
 fn gather_score() {
-
     eprintln!("Open the game within 2 seconds of starting this.");
     thread::sleep(Duration::from_millis(2000));
 
     let pos = arena::get_active_window_pos();
 
     eprintln!("{pos:?}");
-    
+
     let num_list = arena::get_nums();
 
     let ss = arena::screenshot(pos);
@@ -417,7 +482,7 @@ fn gather_score() {
 
     let mut outp = vec![];
 
-    let frame_time = 1.0/60.0;
+    let frame_time = 1.0 / 60.0;
     let mut frame_el;
     loop {
         frame_el = std::time::SystemTime::now();
@@ -431,16 +496,24 @@ fn gather_score() {
         }
 
         while frame_el.elapsed().unwrap().as_secs_f32() < frame_time {
-            thread::sleep(Duration::from_secs_f32(frame_time).saturating_sub(frame_el.elapsed().unwrap()))
+            thread::sleep(
+                Duration::from_secs_f32(frame_time).saturating_sub(frame_el.elapsed().unwrap()),
+            )
         }
     }
     dbg!(start.elapsed().unwrap());
     let l = outp.len() as f32;
     let mut r = thread_rng();
     for (i, img) in outp.into_iter().enumerate() {
-        img.save(format!("images/encoder_data/{}_{}_{}.png", r.next_u32(), r.next_u32(), r.next_u32())).unwrap();
-        if i%500 == 0 {
-            println!("Got {i} done, {}", i as f32/l);
+        img.save(format!(
+            "images/encoder_data/{}_{}_{}.png",
+            r.next_u32(),
+            r.next_u32(),
+            r.next_u32()
+        ))
+        .unwrap();
+        if i % 500 == 0 {
+            println!("Got {i} done, {}", i as f32 / l);
         }
     }
 }

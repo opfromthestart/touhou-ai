@@ -21,7 +21,7 @@ from PIL import Image
 
 # Define Config variables
 image_size = (400, 640)
-data_path = "./images/"
+data_path = "images/encoder_data/"
 
 batch_size = 4
 learning_rate = 0.0001
@@ -182,8 +182,9 @@ for epoch in range(epochs):
        
         if done%100 == 0:
             print(img.shape, mid.shape, recon.shape)
-            torchvision.utils.save_image(img[0], "input{}.png".format(done))
-            torchvision.utils.save_image(recon[0], "output{}.png".format(done))
+            print(img[0,0,69:79,470:480])
+            torchvision.utils.save_image(img[0], "dbg_images/pyinput{}.png".format(done))
+            torchvision.utils.save_image(recon[0], "dbg_images/pyoutput{}.png".format(done))
         done += 1
 
     epoch_loss = epoch_loss / len(Tr_DL)
