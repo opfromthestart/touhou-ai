@@ -1,4 +1,7 @@
 /target
 /ai-file/*
 /dbg_images/*
+/images/critic_data/*
+/images/encoder_data/*
+/images/actor_critic_data/*
 !*/.gitkeep

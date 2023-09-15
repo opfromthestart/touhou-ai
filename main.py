@@ -1,11 +1,12 @@
 # Import Libraries
+import gc
 import glob
 # import json
 import os
-import gc
 from random import shuffle
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torchvision
 from PIL import Image
@@ -33,8 +34,10 @@ print("\nLoading Dataset into DataLoader...")
 
 # Get All Images
 
-all_imgs = glob.glob(data_path+"*")
+all_imgs = glob.glob(data_path + "*")
 shuffle(all_imgs)
+dbg_images = glob.glob("dbg_images/as_input.png")
+
 
 # Train Images
 train_imgs = all_imgs[:2000]
@@ -79,7 +82,12 @@ Tr_DL = torch.utils.data.DataLoader(
 Ts_DL = torch.utils.data.DataLoader(
     imagePrep(test_imgs, dataset_transform), batch_size=batch_size
 )
-
+s_DL = torch.utils.data.DataLoader(
+    imagePrep(dbg_images, dataset_transform), batch_size=1
+)
+for i in s_DL:
+    dbg_image = i[0]
+print(dbg_image)
 
 # Open one image
 print("\nTest Open One Image")
@@ -125,6 +133,26 @@ class ConvAutoencoder(torch.nn.Module):
         decoded = self.decoder(coded)
         return decoded
 
+    def save(self, path):
+        np.savez(
+            path + ".npz",
+            **{
+                "0.0.0.weight": self.encoder[0].weight.cpu().detach().numpy(),
+                "0.0.1.bias": self.encoder[0].bias.cpu().detach().numpy(),
+                "0.1.0.weight": self.encoder[3].weight.cpu().detach().numpy(),
+                "0.1.1.bias": self.encoder[3].bias.cpu().detach().numpy(),
+                "0.2.0.weight": self.encoder[6].weight.cpu().detach().numpy(),
+                "0.2.1.bias": self.encoder[6].bias.cpu().detach().numpy(),
+                "1.0.1.weight": self.decoder[1].weight.cpu().detach().numpy(),
+                "1.0.2.bias": self.decoder[1].bias.cpu().detach().numpy(),
+                "1.1.1.weight": self.decoder[4].weight.cpu().detach().numpy(),
+                "1.1.2.bias": self.decoder[4].bias.cpu().detach().numpy(),
+                "1.2.1.weight": self.decoder[7].weight.cpu().detach().numpy(),
+                "1.2.2.bias": self.decoder[7].bias.cpu().detach().numpy(),
+            }
+        )
+        torch.save(self, path)
+
 
 print("\nConvolutional AutoEncoder Network Model Set!")
 
@@ -135,6 +163,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # defining the model
 convAE_model = ConvAutoencoder().to(device)
+np.save( "dbg_images/npin", dbg_image.numpy())
+dbg_image = dbg_image.to(device)
 try:
     convAE_model = torch.load("ai-file/pysave").to(device)
 except Exception:
@@ -157,7 +187,7 @@ print("\nTraining the Convolutional AutoEncoder Model on Training Data...")
 
 # Training of Model
 
-losses = []
+# losses = []
 for epoch in range(epochs):
     epoch_loss = 0.0
     done = 0
@@ -167,7 +197,6 @@ for epoch in range(epochs):
 
         mid = convAE_model.encoder(img)
         recon = convAE_model.decoder(mid)
-       
 
         loss = loss_function(recon, img)
 
@@ -179,17 +208,24 @@ for epoch in range(epochs):
         epoch_loss += loss
         # print("-", end="", flush=True)
         print(done, "/", len(Tr_DL), end="\r", flush=True)
-       
-        if done%100 == 0:
+
+        if done % 100 == 0:
             print(img.shape, mid.shape, recon.shape)
-            print(img[0,0,69:79,470:480])
-            torchvision.utils.save_image(img[0], "dbg_images/pyinput{}.png".format(done))
-            torchvision.utils.save_image(recon[0], "dbg_images/pyoutput{}.png".format(done))
+            # print(img[0, 0, 69:79, 470:480])
+            torchvision.utils.save_image(
+                img[0], "dbg_images/pyinput{}.png".format(done)
+            )
+            torchvision.utils.save_image(
+                recon[0], "dbg_images/pyoutput{}.png".format(done)
+            )
         done += 1
 
     epoch_loss = epoch_loss / len(Tr_DL)
-    losses.append(epoch_loss)
-    torch.save(convAE_model, "ai-file/pysave")
+    # losses.append(epoch_loss)
+    convAE_model.save("ai-file/pymodel")
+    r = convAE_model(dbg_image)
+    np.save("dbg_images/outp", r.cpu().detach().numpy())
+    torchvision.utils.save_image(r, "dbg_images/encoded_py.png")
     gc.collect()
 
     print("\nEpoch: {} | Loss: {:.4f}".format(epoch + 1, epoch_loss))
@@ -200,7 +236,7 @@ print("\n____________________________________________________\n")
 
 fig = plt.figure(figsize=(12, 5))
 
-plt.plot(losses, "-r", label="Training loss")
+# plt.plot(losses, "-r", label="Training loss")
 plt.xlabel("Epochs", fontsize=15)
 plt.ylabel("Loss", fontsize=15)
 plt.title("Convolutional AutoEncoder Training Loss Vs Epochs", fontsize=15)
