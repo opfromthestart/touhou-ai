@@ -170,7 +170,7 @@ fn train() {
                 .div((i + 1) as u32)
                 .mul((samples / BACK_BATCH - i - 1) as u32);
             eprint!(
-                "{}/{samples} Err: {} Remaining: {:?}    \r",
+                "{:8}/{samples:8} Err: {} Remaining: {:?}    \r",
                 (i + 1) * BACK_BATCH,
                 acc_err / ((i + 1) * BACK_BATCH) as f32,
                 est_remain
@@ -193,7 +193,7 @@ fn train() {
         }
         prev_err = acc_err;
         eprintln!(
-            "Epoch:{epoch} Error: {acc_err} New LR: {}                           ",
+            "Epoch:{epoch:4} Error:      {acc_err} New LR: {}                           ",
             net.get_lr()
         );
 
@@ -372,7 +372,7 @@ fn train_encode() {
                     .div((i + 1) as u32)
                     .mul((samples - i - 1) as u32);
                 eprint!(
-                    "{}/{samples} Err: {} Remaining: {:?}    \r",
+                    "{:8}/{samples:8} Err: {} Remaining: {:?}    \r",
                     i + 1,
                     acc_err / ((i + 1) * BACK_BATCH) as f32,
                     est_remain
@@ -883,7 +883,7 @@ fn train_actor(use_critic: bool) {
                 // let ao = actor.forward(img[0]);
                 // let co = critic.forward(img[0], &ao);
                 eprint!(
-                    "{}/{datasize} Err: {} Remaining: {:?}  \r", // Result {ao:?} Score {co:?}
+                    "{:8}/{datasize:8} Err: {} Remaining: {:?}  \r", // Result {ao:?} Score {co:?}
                     (i + 1) * BACK_BATCH,
                     acc_err / ((i + 1) * BACK_BATCH) as f32,
                     est_remain,
@@ -916,7 +916,7 @@ fn train_actor(use_critic: bool) {
                 // let ao = actor.forward(img[0]);
                 // let co = critic.forward(img[0], &ao);
                 eprint!(
-                    "{}/{datasize} Err: {} Remaining: {:?}  \r", // Result {ao:?} Score {co:?}
+                    "{:8}/{datasize:8} Err: {} Remaining: {:?}  \r", // Result {ao:?} Score {co:?}
                     (i + 1) * BACK_BATCH,
                     acc_err / ((i + 1) * BACK_BATCH) as f32,
                     est_remain,
@@ -932,7 +932,7 @@ fn train_actor(use_critic: bool) {
         prev_err = acc_err;
         // epoch += 1;
         eprintln!(
-            "Epoch:{epoch} Error: {acc_err} LR: {}                           ",
+            "Epoch:{epoch:4} Error:      {acc_err} LR: {}                           ",
             actor.get_lr()
         );
 
