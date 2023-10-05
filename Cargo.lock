@@ -334,7 +334,7 @@ dependencies = [
 [[package]]
 name = "dfdx"
 version = "0.13.0"
-source = "git+https://github.com/coreylowman/dfdx.git?branch=main#4cfba9af0d51bbf6861442e34d0b62b3c36aa557"
+source = "git+https://github.com/coreylowman/dfdx.git?branch=main#9a208d928b92dd77d4b2fa79144bdc8b872aa7f0"
 dependencies = [
  "cudarc",
  "gemm",
@@ -1213,10 +1213,12 @@ name = "touhou-ai"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "cudarc",
  "device_query",
  "dfdx",
  "enigo",
  "image",
+ "once_cell",
  "rand",
  "screenshots",
  "serde",

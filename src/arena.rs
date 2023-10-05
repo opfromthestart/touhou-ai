@@ -1,12 +1,14 @@
 // Everything to setup the training, eg the arena.
 
-use std::{fs, ops::Range, sync::Mutex};
+use std::{fs, ops::Range, sync::Mutex, thread, time::Duration};
 
 use device_query::Keycode;
 use enigo::{Key, KeyboardControllable};
 use image::{GenericImageView, ImageBuffer, Luma, Pixel, Rgb, Rgba};
 use once_cell::sync::Lazy;
-use rand::{seq::SliceRandom, thread_rng, Rng};
+use rand::{seq::SliceRandom, Rng};
+
+use crate::net::{to_flat, to_pixels};
 
 pub(crate) type Image = ImageBuffer<Rgb<u8>, Vec<u8>>;
 pub(crate) type ImageA = ImageBuffer<Rgba<u8>, Vec<u8>>;
@@ -79,6 +81,12 @@ pub(crate) fn get_nums() -> Vec<ImageA> {
 pub(crate) fn get_gameover() -> ImageA {
     image::open("images/gameover.png").unwrap().to_rgba8()
 }
+pub(crate) fn get_life() -> ImageA {
+    image::open("images/life.png").unwrap().to_rgba8()
+}
+pub(crate) fn get_dia() -> ImageA {
+    image::open("images/text_box.png").unwrap().to_rgba8()
+}
 
 pub(crate) fn get_pixel_range<P: Pixel<Subpixel = u8>>(
     img: &ImageBuffer<P, Vec<u8>>,
@@ -93,6 +101,7 @@ pub(crate) fn get_pixel_range<P: Pixel<Subpixel = u8>>(
     ret
 }
 
+#[allow(dead_code)]
 pub(crate) fn image_to_u8(img: &ImageBuffer<Rgb<f32>, Vec<f32>>) -> Image {
     let mut ret_img: Image = image::ImageBuffer::new(img.width(), img.height());
     for x in 0..img.width() {
@@ -177,6 +186,7 @@ pub(crate) fn match_template(image: &Image, template: &ImageA) -> ImageBuffer<Lu
     result
 }
 
+#[allow(dead_code)]
 pub(crate) fn img_diff(image1: &Image, image2: &Image) -> Image {
     let (width1, height1) = image1.dimensions();
     let (width2, height2) = image2.dimensions();
@@ -209,6 +219,19 @@ pub(crate) fn img_diff(image1: &Image, image2: &Image) -> Image {
 //    img.as_bytes().iter().map(|x| *x as f32/256.).collect::<Vec<_>>()
 //}
 
+fn is_white(img: &Image) -> bool {
+    let mut wc = 0;
+    let mut count = 0;
+    for (_x, _y, px) in img.enumerate_pixels() {
+        if px.0.iter().all(|x| *x == 255) {
+            wc += 1;
+        }
+        count += 1
+    }
+    // println!("{wc} {count}");
+    wc * 2 > count
+}
+
 pub(crate) fn has_lost(img: &Image, gameover: &ImageA) -> bool {
     let gameover_img = get_pixel_range(img, (147..271, 193..209));
     match_template(&gameover_img, gameover)
@@ -216,12 +239,23 @@ pub(crate) fn has_lost(img: &Image, gameover: &ImageA) -> bool {
         .filter(|x| x.0[0] == 0.0)
         .next()
         .is_some()
+        && !is_white(&gameover_img)
+}
+pub(crate) fn num_lives(img: &Image, life: &ImageA) -> isize {
+    let life_img = get_pixel_range(img, (497..610, 274..289));
+    match_template(&life_img, life)
+        .pixels()
+        .filter(|x| x.0[0] == 0.0)
+        .count() as isize
 }
 
-pub(crate) fn get_score(img: &Image, nums: &[ImageA]) -> Option<u32> {
+pub(crate) fn get_score(img: &Image, nums: &[ImageA]) -> Option<isize> {
     let mut score = [20; 8];
 
     let score_img = get_pixel_range(img, (449..577, 97..113));
+    if is_white(&score_img) {
+        return None;
+    }
     //score_img.save("score check/score.png").unwrap();
     for (i, n) in nums.iter().enumerate() {
         let matching = match_template(&score_img, n)
@@ -259,7 +293,7 @@ pub(crate) fn get_score(img: &Image, nums: &[ImageA]) -> Option<u32> {
                 .rev()
                 .enumerate()
                 .rev()
-                .map(|(i, v)| 10u32.pow(i as u32) * *v as u32)
+                .map(|(i, v)| 10isize.pow(i as u32) * *v as isize)
                 .sum(),
         )
     }
@@ -337,6 +371,7 @@ enum PauseState {
 }
 
 #[derive(PartialEq, Eq)]
+#[allow(dead_code)]
 enum Mode {
     Start,
     Demo,
@@ -386,8 +421,9 @@ pub(crate) fn start(pos: (i32, i32), nums: &[ImageA]) {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn reset(pos: (i32, i32), nums: &[ImageA]) {
-    let mut e = enigo::Enigo::new();
+    // let mut e = enigo::Enigo::new();
     //e.key_click(Key::Escape)
 
     start(pos, nums);
@@ -411,6 +447,59 @@ pub(crate) fn get_enc_batch<R: Rng>(n: usize, r: &mut R) -> Vec<Image> {
         .map(|f| image::open(f).unwrap().into_rgb8())
         .collect()
 }
+pub(crate) fn get_actor_iter() -> ActImgSeq {
+    let files = fs::read_dir("images/actor_critic_data").unwrap();
+    let to_ret: Vec<_> = files
+        .filter_map(|x| {
+            let y = x.unwrap();
+            // println!("{}", y.path().to_str().unwrap());
+            if y.file_type().unwrap().is_file() && y.path().to_str().unwrap().contains(".png") {
+                Some(y.path().to_str().unwrap().to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    ActImgSeq::new(to_ret)
+}
+pub(crate) struct ActImgSeq {
+    files: Vec<String>,
+    i: usize,
+}
+#[allow(dead_code)]
+impl ActImgSeq {
+    fn new(files: Vec<String>) -> Self {
+        ActImgSeq { files, i: 0 }
+    }
+
+    pub(crate) fn shuffle<R: Rng>(&mut self, r: &mut R) {
+        self.files[self.i..].shuffle(r);
+    }
+    pub(crate) fn reset(&mut self) {
+        self.i = 0;
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.files.len()
+    }
+    pub(crate) fn peek(&mut self) -> Option<<&mut Self as Iterator>::Item> {
+        let mut s = self;
+        let v = s.next();
+        s.i -= 1;
+        v
+    }
+}
+impl Iterator for &mut ActImgSeq {
+    type Item = Vec<f32>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let name = self.files.get(self.i)?;
+        self.i += 1;
+        let img = image::open(name).unwrap().into_rgb8();
+        let img = to_pixels(&img);
+        Some(img)
+    }
+}
+#[allow(dead_code)]
 pub(crate) fn get_crit_seq<R: Rng>(n: usize, r: &mut R) -> Vec<(Image, Vec<f32>, f32)> {
     let files = fs::read_dir("images/critic_data").unwrap();
     let to_ret: Vec<_> = files
@@ -455,10 +544,49 @@ pub(crate) fn get_crit_seq<R: Rng>(n: usize, r: &mut R) -> Vec<(Image, Vec<f32>,
         })
         .collect()
 }
+pub(crate) struct CritSeq {
+    files: Vec<String>,
+    i: usize,
+}
+impl CritSeq {
+    fn new(files: Vec<String>) -> Self {
+        CritSeq { files, i: 0 }
+    }
+
+    pub(crate) fn shuffle<R: Rng>(&mut self, r: &mut R) {
+        self.files[self.i..].shuffle(r);
+    }
+    pub(crate) fn reset(&mut self) {
+        self.i = 0;
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.files.len()
+    }
+}
+impl Iterator for &mut CritSeq {
+    type Item = (Vec<f32>, Vec<f32>, f32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // if self.i > 100 {
+        //     return None;
+        // }
+        let name = self.files.get(self.i)?;
+        self.i += 1;
+        let seq_name = name.split(".").next().unwrap();
+        let json = std::fs::read_to_string(format!("{seq_name}.done.json")).unwrap();
+        // println!("{json} {seq_name}");
+        let Ok((key, score)): Result<(Vec<f32>, f32), _> = serde_json::from_str(&json) else {
+            return None;
+        };
+        let key = to_flat(&key);
+        let img = image::open(format!("{seq_name}.png")).unwrap().into_rgb8();
+        let img = to_pixels(&img);
+        Some((img, key, score))
+    }
+}
+#[allow(dead_code)]
 pub(crate) fn get_crit_batch<R: Rng>(n: usize, r: &mut R) -> Vec<(Image, Vec<f32>, f32)> {
-    let files = fs::read_dir("images/critic_data")
-        .unwrap()
-        .chain(fs::read_dir("images/actor_critic_data").unwrap());
+    let files = fs::read_dir("images/actor_critic_data").unwrap();
     let to_ret: Vec<_> = files
         .filter_map(|x| {
             let y = x.unwrap();
@@ -477,16 +605,36 @@ pub(crate) fn get_crit_batch<R: Rng>(n: usize, r: &mut R) -> Vec<(Image, Vec<f32
     //     .map(|f| image::open(f).unwrap().into_rgb8())
     //     .collect()
     let seq = to_ret.choose_multiple(r, n);
-    seq.map(|n| {
+    seq.filter_map(|n| {
         let seq_name = n.to_str().unwrap().split(".").next().unwrap();
         let json = std::fs::read_to_string(format!("{seq_name}.done.json")).unwrap();
-        let (key, score): (Vec<f32>, f32) = serde_json::from_str(&json).unwrap();
+        // println!("{json} {seq_name}");
+        let Ok((key, score)): Result<(Vec<f32>, f32), _> = serde_json::from_str(&json) else {
+            return None;
+        };
         let img = image::open(format!("{seq_name}.png")).unwrap().into_rgb8();
-        (img, key, score)
+        Some((img, key, score))
     })
     .collect()
 }
-pub(crate) fn process_crit(gamma: f32) {
+pub(crate) fn get_crit_iter() -> CritSeq {
+    let files = fs::read_dir("images/actor_critic_data").unwrap();
+    let to_ret: Vec<_> = files
+        .filter_map(|x| {
+            let y = x.unwrap();
+            // println!("{}", y.path().to_str().unwrap());
+            if y.file_type().unwrap().is_file() && y.path().to_str().unwrap().contains(".done.json")
+            {
+                Some(y.path().to_str().unwrap().to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    CritSeq::new(to_ret)
+}
+#[allow(dead_code)]
+pub(crate) fn process_crit_(gamma: f32) {
     let files = fs::read_dir("images/critic_data").unwrap();
     let to_ret: Vec<_> = files
         .filter_map(|x| {
@@ -545,7 +693,7 @@ pub(crate) fn process_crit(gamma: f32) {
             }
         }
         println!();
-        for (i, (data, name)) in key_vec
+        for (_, (data, name)) in key_vec
             .into_iter()
             .zip(out_vec.into_iter())
             .zip(name_vec.into_iter())
@@ -558,9 +706,9 @@ pub(crate) fn process_crit(gamma: f32) {
             .unwrap();
         }
     }
-    process_crit_act(gamma);
+    // process_crit_act(gamma);
 }
-pub(crate) fn process_crit_act(gamma: f32) {
+pub(crate) fn process_crit(gamma: f32) {
     let files = fs::read_dir("images/actor_critic_data").unwrap();
     let to_ret: Vec<_> = files
         .filter_map(|x| {
@@ -619,7 +767,7 @@ pub(crate) fn process_crit_act(gamma: f32) {
             }
         }
         println!();
-        for (i, (data, name)) in key_vec
+        for (_, (data, name)) in key_vec
             .into_iter()
             .zip(out_vec.into_iter())
             .zip(name_vec.into_iter())
@@ -631,5 +779,113 @@ pub(crate) fn process_crit_act(gamma: f32) {
             )
             .unwrap();
         }
+    }
+}
+
+pub(crate) fn analyze_crit() {
+    // let mut r = thread_rng();
+    let dataset = {
+        let files = fs::read_dir("images/actor_critic_data").unwrap();
+        let to_ret: Vec<_> = files
+            .filter_map(|x| {
+                let y = x.unwrap();
+                // println!("{}", y.path().to_str().unwrap());
+                if y.file_type().unwrap().is_file()
+                    && y.path().to_str().unwrap().contains(".done.json")
+                {
+                    Some(y.path())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // to_ret
+        //     .choose_multiple(r, n)
+        //     .into_iter()
+        //     .map(|f| image::open(f).unwrap().into_rgb8())
+        //     .collect()
+        let seq = to_ret.iter();
+        seq.filter_map(|n| {
+            let seq_name = n.to_str().unwrap().split(".").next().unwrap();
+            let json = std::fs::read_to_string(format!("{seq_name}.done.json")).unwrap();
+            // println!("{json} {seq_name}");
+            let Ok((_, score)): Result<(Vec<f32>, f64), _> = serde_json::from_str(&json) else {
+                return None;
+            };
+            Some(score)
+        })
+        .collect::<Vec<_>>()
+    };
+    let mut sum = 0.0f64;
+    let mut sumsq = 0.0f64;
+    for i in dataset.iter() {
+        sum += i;
+        sumsq += i * i;
+    }
+    let mean = sum / (dataset.len() as f64);
+    let exsq = sumsq / (dataset.len() as f64);
+    let var = exsq - mean * mean;
+    let sd = var.sqrt();
+    println!("Mean: {mean}");
+    println!("SD: {sd}");
+    let mut num_outlier = 0;
+    let mut max = f64::MIN;
+    let mut min = f64::MAX;
+    for i in dataset.iter() {
+        if (i - mean).abs() > sd * 4. {
+            num_outlier += 1;
+            // println!("{i}");
+        }
+        if i > &max {
+            max = *i;
+        }
+        if i < &min {
+            min = *i;
+        }
+    }
+    println!(
+        "Outlier (4sd): {}",
+        (num_outlier as f64) / (dataset.len() as f64)
+    );
+    println!("Min {min} max {max}");
+}
+pub(crate) fn reset_from_gameover() {
+    thread::sleep(Duration::from_millis(5000));
+    for _ in 0..2 {
+        println!("Rlset");
+        do_keys(&[true, false, false, false, false, false]);
+        thread::sleep(Duration::from_millis(200));
+        // println!("Rlset");
+        do_keys(&[false, false, false, false, false, false]);
+        thread::sleep(Duration::from_millis(200));
+    }
+    println!("Reset");
+    do_keys(&[false, false, false, true, false, false]);
+    thread::sleep(Duration::from_millis(200));
+    do_keys(&[false, false, false, false, false, false]);
+    thread::sleep(Duration::from_millis(200));
+    // println!("Reset");
+    do_keys(&[true, false, false, false, false, false]);
+    thread::sleep(Duration::from_millis(200));
+    do_keys(&[false, false, false, false, false, false]);
+    // println!("Reset");
+    // thread::sleep(Duration::from_millis(3000));
+}
+
+pub(crate) fn do_dialog(img: &Image, dia: &ImageA) {
+    let score_img = get_pixel_range(img, (42..58, 321..329));
+
+    let skip = match_template(&score_img, dia)
+        .pixels()
+        .filter(|x| x.0[0] == 0.0)
+        .next()
+        .is_some();
+    if skip {
+        do_keys(&[false, false, false, false, false, false]);
+        thread::sleep(Duration::from_millis(33));
+        do_keys(&[true, false, false, false, false, false]);
+        thread::sleep(Duration::from_millis(33));
+        do_keys(&[false, false, false, false, false, false]);
+        thread::sleep(Duration::from_millis(33));
     }
 }
