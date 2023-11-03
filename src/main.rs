@@ -3,30 +3,32 @@
 #![feature(array_chunks)]
 #![feature(iter_array_chunks)]
 
+#[allow(unused_imports)]
+use std::time::SystemTime;
 use std::{
     collections::BTreeMap,
     ops::{Div, Mul},
     thread,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
-use arena::{analyze_crit, join_channel, process_crit, GrayImage};
+use arena::{analyze_crit, get_q_iter, join_channel, process_crit, GrayImage};
 use clap::Parser;
 use dfdx::{
     shapes::Const,
-    tensor::{AsArray, Tensor, TensorFromVec, ZerosTensor},
+    tensor::{AsArray, Gradients, Tensor, TensorFromVec, ZerosTensor},
 };
 use net::{from_pixels, NetActor};
 use once_cell::sync::Lazy;
-use rand::{thread_rng, RngCore};
+use rand::{thread_rng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     arena::{
-        do_dialog, get_actor_iter, get_crit_iter, get_dia, get_enc_batch, get_gameover, get_life,
-        get_pixel_range, has_lost, num_lives, reset_from_gameover, wants_exit,
+        do_dialog, get_actor_iter, get_crit_iter, get_dia, get_gameover, get_life, get_pixel_range,
+        has_lost, num_lives, reset_from_gameover, wants_exit,
     },
-    net::{collapse, from_flat, to_flat, NetCrit, NetDevice},
+    net::{from_flat, to_flat, NetCrit, NetDevice, NetQ},
 };
 
 //use coaster::{Backend, Cuda, frameworks::cuda::get_cuda_backend};
@@ -59,33 +61,46 @@ enum Mode {
     Analyze,
     AnalyzeActor { bins: String },
     ResetLr,
+    DoLoop,
+    TestQ,
 }
 
 fn main() {
     let m = Mode::parse();
 
     match m {
-        Mode::EvalCritic => test_img(),
-        Mode::TrainCritic => train(),
+        Mode::EvalCritic => test_img(None),
+        Mode::TrainCritic => train(None),
         Mode::TrainEncode => train_encode(),
         Mode::EvalEncode => test_encode(None),
         Mode::GatherEncode => gather_encode(),
         Mode::EvalPython => test_python(),
         Mode::EvalGame => todo!(),
         Mode::GatherCritic => gather_critic(),
-        Mode::TrainActor { use_crit } => train_actor(use_crit == "crit"),
+        Mode::TrainActor { use_crit } => train_actor(
+            if use_crit == "crit" {
+                true
+            } else if use_crit == "nocrit" {
+                false
+            } else {
+                panic!("Must use either \"crit\" or \"nocrit\".")
+            },
+            None,
+        ),
         Mode::ProcessCritic => process_crit(0.97),
-        Mode::GatherPlay => gather_live_actor(),
+        Mode::GatherPlay => gather_live_actor(10000, None, None),
         Mode::Analyze => analyze_crit(),
         Mode::AnalyzeActor { bins } => analyze_actor(bins),
         Mode::ResetLr => reset_lr(),
+        Mode::DoLoop => do_loop(),
+        Mode::TestQ => test_q(),
     }
     //test_img();
 }
 const SINGLE: bool = false;
 
-const MEM_BATCH: usize = 8;
-const BACK_BATCH: usize = if SINGLE { 1 } else { 8 }; // Should be divisible by MEM_BATCH
+const BATCH: usize = 10;
+const ENC_BATCH: usize = 2;
 const DECAY_RATE: f64 = 1.0;
 static DATASIZE: Lazy<Option<usize>> = Lazy::new(|| {
     let x = std::fs::read_to_string("ai-file/batch")
@@ -100,8 +115,9 @@ static DATASIZE: Lazy<Option<usize>> = Lazy::new(|| {
     x
 });
 
-fn train() {
+fn train(limit: Option<usize>) {
     eprintln!("making net");
+    let limit = limit.unwrap_or(usize::MAX);
 
     let mut net = match NetCrit::load("ai-file/th2_critic.net") {
         Some(n) => n,
@@ -109,8 +125,8 @@ fn train() {
             println!("Loading from encoder");
             match NetCrit::load_from_encode("ai-file/th2_critic.net", "ai-file/th2_encode.net") {
                 Ok(n) => n,
-                Err(_) => {
-                    println!("Could not use encoder");
+                Err(e) => {
+                    println!("Could not use encoder: {e:?}");
                     NetCrit::load_or_new("ai-file/th2_critic.net")
                 }
             }
@@ -123,22 +139,22 @@ fn train() {
     let target_err = 0.01f32.powi(2) * 0.0001;
     let mut prev_err = f32::MAX;
 
-    let mut grad = net.grad();
-    let mut derr;
+    let mut grad: Option<Gradients<_, _>>;
 
-    let mut outp = get_crit_iter();
+    let (mut outp, mut test_outp) = get_crit_iter().split_test(16000);
     let datasize = DATASIZE.unwrap_or(outp.len());
 
     let mut r = thread_rng();
 
-    test_img();
+    test_img(Some(&net));
 
     println!("Training");
-    while acc_err > target_err {
+    while acc_err > target_err && epoch < limit {
         // println!("Getting images and data");
 
         outp.reset();
         outp.shuffle(&mut r);
+        test_outp.reset();
         // permute(&mut outp, &perm);
 
         let epoch_start = std::time::SystemTime::now();
@@ -147,44 +163,45 @@ fn train() {
 
         let samples = datasize;
 
-        for (i, batch) in (&mut outp)
-            .array_chunks::<BACK_BATCH>()
+        // let img = img.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
+        // let keys = keys.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
+        for (i, b) in (&mut outp)
+            .array_chunks::<BATCH>()
+            .take(datasize)
             .enumerate()
-            .take(datasize / BACK_BATCH)
-        // outp.chunks_exact(BATCH).enumerate()
         {
-            // let img = img.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
-            // let keys = keys.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
-            for b in batch.array_chunks::<MEM_BATCH>() {
-                let img = b.iter().map(|x| &x.0 as &[f32]).collect::<Vec<_>>();
-                let keys = b.iter().map(|x| &x.1 as &[f32]).collect::<Vec<_>>();
-                let acc_own = b.iter().map(|x| [x.2]).collect::<Vec<_>>();
-                let acc = acc_own.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
-                (derr, grad) = net.acc_grad::<MEM_BATCH>(&img, &keys, &acc, grad);
-                acc_err += derr;
-            }
-            grad = net.backward(grad);
+            let img = b.iter().map(|x| &x.0 as &[f32]).collect::<Vec<_>>();
+            let keys = b.iter().map(|x| &x.1 as &[f32]).collect::<Vec<_>>();
+            let acc_own = b.iter().map(|x| [x.2]).collect::<Vec<_>>();
+            let acc = acc_own.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
+            let (derr, grad2) = net.acc_grad::<BATCH>(&img, &keys, &acc);
+            grad = Some(grad2);
+            acc_err += derr;
+
+            net.backward(grad.unwrap());
+            // grad = None;
             let est_remain = epoch_start
                 .elapsed()
                 .unwrap()
                 .div((i + 1) as u32)
-                .mul((samples / BACK_BATCH - i - 1) as u32);
+                .mul((samples / BATCH - i - 1) as u32);
             eprint!(
                 "{:8}/{samples:8} Err: {} Remaining: {:?}    \r",
-                (i + 1) * BACK_BATCH,
-                acc_err / ((i + 1) * BACK_BATCH) as f32,
+                (i + 1) * BATCH,
+                acc_err / ((i + 1) * BATCH) as f32,
                 est_remain
             );
-            // if i % 400 == 0 {
-            //     if !acc_err.is_nan() && acc_err.is_finite() {
-            //         net.save("ai-file/th2_critic.net").unwrap();
-            //         test_img()
-            //     } else {
-            //         eprintln!("Get [NaN|inf]ed lol.");
-            //         break 'ep_loop;
-            //     }
-            // }
         }
+        // if i % 400 == 0 {
+        //     if !acc_err.is_nan() && acc_err.is_finite() {
+        //         net.save("ai-file/th2_critic.net").unwrap();
+        //         test_img()
+        //     } else {
+        //         eprintln!("Get [NaN|inf]ed lol.");
+        //         break 'ep_loop;
+        //     }
+        // }
+
         //grad = net.backward(grad);
         acc_err /= datasize as f32;
         epoch += 1;
@@ -192,14 +209,24 @@ fn train() {
             net.decay_lr(DECAY_RATE);
         }
         prev_err = acc_err;
+        let mut test_err = 0.0;
+        for b in (&mut test_outp).array_chunks::<BATCH>() {
+            let img = b.iter().map(|x| &x.0 as &[f32]).collect::<Vec<_>>();
+            let keys = b.iter().map(|x| &x.1 as &[f32]).collect::<Vec<_>>();
+            let acc_own = b.iter().map(|x| [x.2]).collect::<Vec<_>>();
+            let acc = acc_own.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
+            let (derr, _) = net.acc_grad::<BATCH>(&img, &keys, &acc);
+            test_err += derr;
+        }
+        test_err /= test_outp.len() as f32;
         eprintln!(
-            "Epoch:{epoch:4} Error:      {acc_err} New LR: {}                           ",
+            "Epoch:{epoch:4} Error:      {acc_err} Test err: {test_err} New LR: {}                           ",
             net.get_lr()
         );
 
         if !acc_err.is_nan() && acc_err.is_finite() {
             net.save("ai-file/th2_critic.net").unwrap();
-            test_img()
+            test_img(Some(&net));
         } else {
             eprintln!("Get [NaN|inf]ed lol.");
             break;
@@ -224,28 +251,33 @@ fn permute<T>(v: &mut [T], p: &[usize]) {
     }
 }
 
-fn test_img() {
+fn test_img(net: Option<&NetCrit>) {
     let to_run = image::open("dbg_images/test img4.png").unwrap().to_rgb8();
     let to_run_pix = net::to_pixels(&to_run);
     let to_run4 = image::open("dbg_images/test img3.png").unwrap().to_rgb8();
     let to_run4_pix = net::to_pixels(&to_run4);
     //eprintln!("{:?}", to_run_pix)eprintln!("making net");
-    let net = match NetCrit::load("ai-file/th2_critic.net") {
-        Some(n) => n,
-        None => {
-            println!("Could not use encoder");
-            NetCrit::load_or_new("ai-file/th2_critic.net")
-        }
-    }; //::<Backend<Cuda>>
-       // println!("{}", to_run_pix.len());
-       // let conv = net.do_conv(&to_run_pix);
-       // println!("{}", conv.len());
-       // let s = conv[0].len() as f32;
-       // let t = conv
-       //     .iter()
-       //     .map(|x| x.iter().map(|x| x.abs()).sum::<f32>() / s)
-       //     .collect::<Vec<_>>();
-       // eprintln!("weight: {:?}", t);
+    let net = net.unwrap_or_else(|| {
+        let net = match NetCrit::load("ai-file/th2_critic.net") {
+            Some(n) => n,
+            None => {
+                println!("Could not load critic in test");
+                NetCrit::load_or_new("ai-file/th2_critic.net")
+            }
+        };
+        let net = Box::new(net);
+        Box::<NetCrit>::leak(net)
+    });
+    //::<Backend<Cuda>>
+    // println!("{}", to_run_pix.len());
+    // let conv = net.do_conv(&to_run_pix);
+    // println!("{}", conv.len());
+    // let s = conv[0].len() as f32;
+    // let t = conv
+    //     .iter()
+    //     .map(|x| x.iter().map(|x| x.abs()).sum::<f32>() / s)
+    //     .collect::<Vec<_>>();
+    // eprintln!("weight: {:?}", t);
     let keys = to_flat(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
     let zkeys = to_flat(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
     // conv.into_iter()
@@ -281,7 +313,18 @@ fn test_img() {
     //     net.forward(&to_run_pix, &keys);
     //     // println!("{:?}", start.elapsed());
     // }
-    // println!("Took {:?} for 60", now.elapsed().unwrap());
+    // println!("critic took {:?} for 60", now.elapsed().unwrap());
+
+    // drop(net);
+    // let act = NetActor::load_or_new("ai-file/th2_actor.net");
+    // let now = SystemTime::now();
+    // for _ in 0..60 {
+    //     // println!("{:?}", net.forward(&to_run_pix, &keys));
+    //     // let start = Instant::now();
+    //     act.forward(&to_run_pix);
+    //     // println!("{:?}", start.elapsed());
+    // }
+    // println!("actor took {:?} for 60", now.elapsed().unwrap());
 
     // let latent = net
     //     .do_conv(&to_run_pix)
@@ -305,6 +348,7 @@ fn test_img() {
     //     std::mem::transmute(bytes)
     // };
     // eprintln!("{:?}", &floats[..l]);
+    net.clear_grad();
 }
 
 #[test]
@@ -318,7 +362,7 @@ fn does_permute() {
 }
 
 fn train_encode() {
-    let datasize = BACK_BATCH * 500;
+    let datasize = ENC_BATCH * 5000;
 
     eprintln!("making net");
     let mut net = net::NetAutoEncode::load_or_new("ai-file/th2_encode.net"); //::<Backend<Cuda>>
@@ -327,94 +371,63 @@ fn train_encode() {
     let mut epoch = 0;
     let target_err = 0.03f32.powi(2);
 
-    let mut grad = net.grad();
-    let mut derr;
-
-    let mut outp: Vec<Vec<f32>> = vec![];
+    let mut outp = get_actor_iter();
 
     let mut r = thread_rng();
 
     if SINGLE {
-        outp = [image::open("dbg_images/test img.png")]
-            .map(|x| net::to_pixels(&x.unwrap().to_rgb8()))
-            .to_vec();
-        println!("{:?}", &outp[0][0..20]);
+        outp.files = vec!["dbg_images/test img.png".into()];
     }
 
     while acc_err > target_err {
         eprint!("Loading images\r");
         if !SINGLE {
-            outp = get_enc_batch(datasize, &mut r)
-                .into_iter()
-                .map(|x| net::to_pixels(&x))
-                .collect();
+            outp.reset();
+            outp.shuffle(&mut r);
         }
 
         let epoch_start = std::time::SystemTime::now();
 
         acc_err = 0.0;
 
-        let samples = outp.len() / BACK_BATCH;
+        // let samples = outp.len() / ENC_BACK_BATCH;
 
-        if !SINGLE {
-            for (i, img) in outp.chunks_exact(BACK_BATCH).enumerate() {
-                let img = img.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
-                for imgb in img.chunks_exact(MEM_BATCH) {
-                    (derr, grad) = net.train_grad::<MEM_BATCH>(&imgb, grad);
-                    acc_err += derr;
-                    // grad = net.backward(grad);
-                    // acc_err += net.train_batch::<MEM_BATCH>(imgb);
-                }
-
-                let est_remain = epoch_start
-                    .elapsed()
-                    .unwrap()
-                    .div((i + 1) as u32)
-                    .mul((samples - i - 1) as u32);
-                eprint!(
-                    "{:8}/{samples:8} Err: {} Remaining: {:?}    \r",
-                    i + 1,
-                    acc_err / ((i + 1) * BACK_BATCH) as f32,
-                    est_remain
-                );
-            }
-        } else {
-            for i in 0..datasize {
-                let img = vec![&outp[0] as &[f32]];
-                for imgb in img.chunks_exact(MEM_BATCH) {
-                    (derr, grad) = net.train_grad::<MEM_BATCH>(&imgb, grad);
-                    acc_err += derr;
-                    // grad = net.backward(grad);
-                    // acc_err += net.train_batch::<MEM_BATCH>(imgb);
-                }
-
-                let est_remain = epoch_start
-                    .elapsed()
-                    .unwrap()
-                    .div((i + 1) as u32)
-                    .mul((datasize - i - 1) as u32);
-                eprint!(
-                    "{}/{datasize} Err: {} Remaining: {:?}    \r",
-                    i + 1,
-                    acc_err / (i + 1) as f32,
-                    est_remain
-                );
-            }
+        for (i, imgb) in (outp)
+            .take(datasize)
+            .array_chunks::<ENC_BATCH>()
+            .enumerate()
+        {
+            let imgb = imgb.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
+            let derr = net.train_grad::<ENC_BATCH>(&imgb);
+            acc_err += derr;
+            // grad = net.backward(grad);
+            // acc_err += net.train_batch::<ENC_MEM_BATCH>(imgb);
+            let est_remain = epoch_start
+                .elapsed()
+                .unwrap()
+                .div((i + 1) as u32)
+                .mul((datasize / ENC_BATCH - i - 1) as u32);
+            eprint!(
+                "{:8}/{:8} Err: {} Remaining: {:?}    \r",
+                i + 1,
+                datasize / ENC_BATCH,
+                acc_err / ((i + 1) * ENC_BATCH) as f32,
+                est_remain
+            );
         }
+
         //grad = net.backward(grad);
         acc_err /= datasize as f32;
         epoch += 1;
-        eprintln!("Epoch:{epoch} Error: {acc_err}                            ");
+        eprintln!("Epoch:{epoch:4}      Error: {acc_err}                            ");
 
         if !acc_err.is_nan() && acc_err.is_finite() && epoch % 1 == 0 {
             net.save("ai-file/th2_encode.net").unwrap();
-            test_encode(outp.last().cloned());
+            // println!("Saved");
+            test_encode((&mut outp).next());
         } else if acc_err.is_nan() || acc_err.is_infinite() {
             eprintln!("Get [NaN|inf]ed lol.");
             break;
-        }
-        if !SINGLE {
-            outp.clear();
         }
     }
 
@@ -458,12 +471,15 @@ fn test_encode(pixels: Option<Vec<f32>>) {
     //eprintln!("{:?}", to_run_pix);
     // eprintln!("making net");
     let net = net::NetAutoEncode::load_or_new("ai-file/th2_encode.net"); //::<Backend<Cuda>>
-                                                                         // eprintln!("Loaded");
-    let now = SystemTime::now();
-    for _ in 0..60 {
-        net.get_latent(&to_run_pix);
-    }
-    println!("Took {:?} for 60", now.elapsed().unwrap());
+
+    // eprintln!("Loaded");
+    // let now = SystemTime::now();
+    // for _ in 0..60 {
+    //     net.get_latent(&to_run_pix);
+    // }
+    // println!("Took {:?} for 60", now.elapsed().unwrap());
+    // let hl = net.get_latent(&to_run_pix);
+    // println!("{:?}", &hl.to_vec()[0..50]);
     let conv = net.forward(&to_run_pix);
     // eprintln!("Ran network");
     let mut grays: [GrayImage; 3] = [
@@ -777,12 +793,19 @@ fn gather_critic() {
     .unwrap();
 }
 
-fn train_actor(use_critic: bool) {
+fn train_actor(use_critic: bool, limit: Option<usize>) {
+    let critic = if use_critic {
+        println!("Using critic");
+        Some(NetCrit::load("ai-file/th2_critic.net").expect("No critic found"))
+    } else {
+        println!("Not using critic");
+        None
+    };
     let mut actor = match NetActor::load("ai-file/th2_actor.net") {
         Some(n) => n,
         None => {
-            println!("Loading from encoder");
-            match NetActor::load_from_encode("ai-file/th2_actor.net", "ai-file/th2_encode.net") {
+            println!("Loading from critic");
+            match NetActor::load_from_critic("ai-file/th2_actor.net", "ai-file/th2_critic.net") {
                 Ok(n) => n,
                 Err(_) => {
                     println!("Could not use encoder");
@@ -791,31 +814,26 @@ fn train_actor(use_critic: bool) {
             }
         }
     }; //::<Backend<Cuda>>
-
-    let critic = if use_critic {
-        println!("Using critic");
-        Some(NetCrit::load("ai-file/th2_critic.net").expect("No critic found"))
-    } else {
-        println!("Not using critic");
-        None
-    };
+    if let Some(c) = critic.as_ref() {
+        actor.dev = c.dev.clone();
+    }
+    let limit = limit.unwrap_or(2000);
 
     let mut r = thread_rng();
-    let epochs = 2000;
-    let mut outpc = get_crit_iter();
-    let mut outpa = get_actor_iter();
+    let (mut outpc, mut testc) = get_crit_iter().split_test(16000);
+    let (mut outpa, mut testa) = get_actor_iter().split_test(16000);
     let datasize = DATASIZE.unwrap_or(outpc.len());
     // let img = get_enc_batch(1, &mut r);
     // let mut outp: Vec<Vec<f32>> = vec![net::to_pixels(&img[0])];
     // let datasize = outp.len();
     let mut acc_err;
     let mut prev_err = f32::MIN;
+    let mut test_err;
 
     // let (mut actor, critic, mut grad) = actor.pair_grad(critic);
-    let mut grad = actor.grad();
-    let mut derr;
+    let mut grad;
 
-    for epoch in 0..epochs {
+    for epoch in 0..limit {
         // eprint!("Loading images\r");
         // if !SINGLE || epoch == 0 {
         //     outp = get_enc_iter();
@@ -858,70 +876,87 @@ fn train_actor(use_critic: bool) {
         //         );
         //     }
         // }
+        test_err = 0.0;
         if use_critic {
             let cr = critic.as_ref().unwrap();
             for (i, img) in outpa
-                .array_chunks::<BACK_BATCH>()
+                .array_chunks::<BATCH>()
                 .enumerate()
-                .take(datasize / BACK_BATCH)
+                .take(datasize / BATCH)
             {
-                for memdata in img.array_chunks::<MEM_BATCH>() {
-                    let img = memdata.iter().map(|x| &x as &[f32]).collect::<Vec<_>>();
-                    (derr, grad) = actor.acc_grad::<MEM_BATCH>(&img, cr, grad);
-                    acc_err += derr;
-                    // grad = net.backward(grad);
-                    // acc_err += net.train_batch::<MEM_BATCH>(imgb);
-                }
-                grad = actor.backward(grad);
+                let img = img.iter().map(|x| &x as &[f32]).collect::<Vec<_>>();
+                let (derr, grad2) = actor.acc_grad::<BATCH>(&img, cr);
+                grad = Some(grad2);
+                acc_err += derr;
+                // grad = net.backward(grad);
+                // acc_err += net.train_batch::<MEM_BATCH>(imgb);
+                actor.backward(grad.unwrap());
+                // grad = None;
 
                 let est_remain = epoch_start
                     .elapsed()
                     .unwrap()
                     .div((i + 1) as u32)
-                    .mul((datasize / BACK_BATCH - i - 1) as u32);
+                    .mul((datasize / BATCH - i - 1) as u32);
 
                 // let ao = actor.forward(img[0]);
                 // let co = critic.forward(img[0], &ao);
                 eprint!(
                     "{:8}/{datasize:8} Err: {} Remaining: {:?}  \r", // Result {ao:?} Score {co:?}
-                    (i + 1) * BACK_BATCH,
-                    acc_err / ((i + 1) * BACK_BATCH) as f32,
+                    (i + 1) * BATCH,
+                    acc_err / ((i + 1) * BATCH) as f32,
                     est_remain,
                 );
             }
+            for b in (&mut testa).array_chunks::<BATCH>() {
+                let img = b.iter().map(|x| &x as &[f32]).collect::<Vec<_>>();
+                let (derr, _) = actor.acc_grad::<BATCH>(&img, cr);
+                test_err += derr;
+            }
+            test_err /= testa.len() as f32;
         } else {
             for (i, img) in outpc
-                .array_chunks::<BACK_BATCH>()
+                .array_chunks::<BATCH>()
                 .enumerate()
-                .take(datasize / BACK_BATCH)
+                .take(datasize / BATCH)
             {
-                for memdata in img.array_chunks::<MEM_BATCH>() {
-                    let img = memdata.iter().map(|x| &x.0 as &[f32]).collect::<Vec<_>>();
-                    let keys = memdata.iter().map(|x| &x.1 as &[f32]).collect::<Vec<_>>();
-                    let scores_ = memdata.iter().map(|x| vec![x.2]).collect::<Vec<_>>();
-                    let scores = scores_.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
-                    (derr, grad) = actor.acc_grad2::<MEM_BATCH>(&img, &keys, &scores, grad);
-                    acc_err += derr;
-                    // grad = net.backward(grad);
-                    // acc_err += net.train_batch::<MEM_BATCH>(imgb);
-                }
-                grad = actor.backward(grad);
+                let imgb = img.iter().map(|x| &x.0 as &[f32]).collect::<Vec<_>>();
+                let keys = img.iter().map(|x| &x.1 as &[f32]).collect::<Vec<_>>();
+                let scores_ = img.iter().map(|x| vec![x.2]).collect::<Vec<_>>();
+                let scores = scores_.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
+                let (derr, grad2) = actor.acc_grad2::<BATCH>(&imgb, &keys, &scores);
+                grad = Some(grad2);
+                acc_err += derr;
+                // grad = net.backward(grad);
+                // acc_err += net.train_batch::<MEM_BATCH>(imgb);
+
+                actor.backward(grad.unwrap());
+                // grad = None;
 
                 let est_remain = epoch_start
                     .elapsed()
                     .unwrap()
                     .div((i + 1) as u32)
-                    .mul((datasize / BACK_BATCH - i - 1) as u32);
+                    .mul((datasize / BATCH - i - 1) as u32);
 
                 // let ao = actor.forward(img[0]);
                 // let co = critic.forward(img[0], &ao);
                 eprint!(
                     "{:8}/{datasize:8} Err: {} Remaining: {:?}  \r", // Result {ao:?} Score {co:?}
-                    (i + 1) * BACK_BATCH,
-                    acc_err / ((i + 1) * BACK_BATCH) as f32,
+                    (i + 1) * BATCH,
+                    acc_err / ((i + 1) * BATCH) as f32,
                     est_remain,
                 );
             }
+            for b in (&mut testc).array_chunks::<BATCH>() {
+                let img = b.iter().map(|x| &x.0 as &[f32]).collect::<Vec<_>>();
+                let keys = b.iter().map(|x| &x.1 as &[f32]).collect::<Vec<_>>();
+                let acc_own = b.iter().map(|x| [x.2]).collect::<Vec<_>>();
+                let acc = acc_own.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
+                let (derr, _) = actor.acc_grad2::<BATCH>(&img, &keys, &acc);
+                test_err += derr;
+            }
+            test_err /= testc.len() as f32;
         }
         // println!("{:?}", actor.net.1 .0 .0.bias);
         //grad = actor.backward(grad);
@@ -931,8 +966,9 @@ fn train_actor(use_critic: bool) {
         }
         prev_err = acc_err;
         // epoch += 1;
+        actor.clear_grad();
         eprintln!(
-            "Epoch:{epoch:4} Error:      {acc_err} LR: {}                           ",
+            "Epoch:{epoch:4} Error:      {acc_err} TestErr: {test_err} LR: {}                           ",
             actor.get_lr()
         );
 
@@ -948,10 +984,12 @@ fn train_actor(use_critic: bool) {
             outpa.shuffle(&mut r);
             outpc.reset();
             outpc.shuffle(&mut r);
+            testa.reset();
+            testc.reset();
         }
     }
 }
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
 struct PlayOptions {
     control_shoot: bool,
     allow_bomb: bool,
@@ -967,7 +1005,7 @@ impl Default for PlayOptions {
         }
     }
 }
-fn gather_live_actor() {
+fn gather_live_actor(games: usize, override_explore: Option<f64>, explore_step: Option<f64>) {
     thread::sleep(Duration::from_millis(2000));
 
     let pos = arena::get_active_window_pos();
@@ -982,13 +1020,15 @@ fn gather_live_actor() {
 
     let ss = arena::screenshot(pos);
     ss.save("dbg_images/test_ss.bmp").unwrap();
-    let actor = NetActor::load("ai-file/th2_actor.net").unwrap();
+    // let actor =
+    // NetActor::load("ai-file/th2_actor.net").unwrap_or_else(|| NetActor::load_or_new(""));
+    let q = NetQ::load_or_new("ai-file/th2_q.net");
     // let explore = std::fs::read_to_string("ai-file/explore")
     //     .expect("Could not find ai-file/explore")
     //     .trim()
     //     .parse()
     //     .expect("explore was not an f32");
-    let settings: PlayOptions = serde_json::from_str(
+    let mut settings: PlayOptions = serde_json::from_str(
         std::fs::read_to_string("ai-file/config")
             .expect("Config file not found")
             .trim(),
@@ -997,21 +1037,28 @@ fn gather_live_actor() {
         eprintln!("{e:?}");
         Default::default()
     });
-    std::fs::write("ai-file/config", serde_json::to_string(&settings).unwrap()).unwrap();
+    if let Some(f) = override_explore {
+        settings.explore = f;
+    }
+    // println!("{settings:?}");
+    // std::fs::write("ai-file/config", serde_json::to_string(&settings).unwrap()).unwrap();
     let mut r = thread_rng();
 
-    loop {
+    for _ in 0..games {
         eprintln!("Initializing");
+
+        let mut settings = settings.clone();
+        // println!("{settings:?}");
 
         arena::start(pos, &num_list);
         let rn = format!("{}{}", r.next_u64(), r.next_u64());
 
-        eprintln!("Start playing now");
+        // eprintln!("Start playing now");
 
         let start = std::time::SystemTime::now();
 
         let mut score: isize = 0;
-        let mut lives = 0;
+        // let mut lives = 0;
 
         let frame_time = 1.0 / 60.0;
         let mut frame_el;
@@ -1032,11 +1079,21 @@ fn gather_live_actor() {
             // let img_pix = net::to_pixels(&img);
 
             //dbg!(&data.as_slice().unwrap()[0..15]);
-            let keys = actor.forward(&pix);
+            // let keys = actor.forward(&pix);
+            let action = if r.gen::<f64>() < settings.explore {
+                r.gen_range(0..32)
+            } else {
+                q.get_move(&pix)
+            };
             // s = s + &format!("apply net {:?}\n", frame_el.elapsed().unwrap());
             stats[2] += frame_el.elapsed().unwrap().as_secs_f64();
 
-            let true_keys = from_flat(&collapse(&keys));
+            // let true_keys = from_flat(&collapse(&keys, settings.explore as f32));
+            let true_keys = from_flat(&{
+                let mut v = vec![0.0; 32];
+                v[action] = 1.0;
+                v
+            });
             let mut key_b = true_keys.iter().map(|x| x == &1.0).collect::<Vec<_>>();
             if !settings.control_shoot {
                 key_b[0] = true;
@@ -1061,17 +1118,16 @@ fn gather_live_actor() {
             //let c = get_cuda_backend();
             //dbg!(&res);
             //res.forward();
-            let new_lives = num_lives(&img, &life);
-            print!("  {new_lives}  \r");
+            let lives = num_lives(&img, &life);
+            print!("  {lives}  \r");
             let new_score = arena::get_score(&img, &num_list).unwrap_or(score) as isize
-                - if lost || new_lives < lives { 50000 } else { 0 };
+                + (lives - if lost { 0 } else { 1 }) * 50000;
             // s = s + &format!("get score {:?}\n", frame_el.elapsed().unwrap());
             stats[5] += frame_el.elapsed().unwrap().as_secs_f64();
 
             //eformat!("{:?}\n", new_score);
             let score_d = new_score - score;
             score = new_score;
-            lives = new_lives;
 
             let name = format!("{}_{}", rn, frames);
             img.save(format!("images/actor_critic_data/{}.png", name))
@@ -1088,6 +1144,10 @@ fn gather_live_actor() {
             }
             // s = s + &format!("scan loss {:?}\n", frame_el.elapsed().unwrap());
             stats[7] += frame_el.elapsed().unwrap().as_secs_f64();
+            if let Some(es) = explore_step {
+                settings.explore += es;
+                // print!("\r{}", settings.explore);
+            }
             // println!("{s}");
 
             //let keys = res.iter().map(|x| *x>0.5).collect::<Vec<_>>();
@@ -1108,12 +1168,13 @@ fn gather_live_actor() {
             format!("{}", frames),
         )
         .unwrap();
-        for (_, time) in stats.iter().enumerate() {
-            println!("{}", time / (frames as f64));
-        }
+        // for (_, time) in stats.iter().enumerate() {
+        // println!("{}", time / (frames as f64));
+        // }
         println!(
-            "{}",
-            (frames as f32) / start.elapsed().unwrap().as_secs_f32()
+            "{} {}|",
+            (frames as f32) / start.elapsed().unwrap().as_secs_f32(),
+            score
         );
         // println!("Reset");
         reset_from_gameover();
@@ -1194,4 +1255,254 @@ fn reset_lr() {
     std::fs::write("ai-file/th2_critic.net.lr", 0.00001.to_string()).unwrap();
     // End actor at:
     std::fs::write("ai-file/th2_actor.net.lr", 0.00001.to_string()).unwrap();
+}
+
+fn reset_crit() {
+    let fd = std::fs::read_dir("images/actor_critic_data").unwrap();
+    let num = std::fs::read_dir("images/actor_critic_data")
+        .unwrap()
+        .count();
+    if num > 500000 {
+        let mut sort = fd.collect::<Vec<_>>();
+        sort.sort_unstable_by_key(|f| f.as_ref().unwrap().metadata().unwrap().modified().unwrap());
+        let old = &sort[0..num - 500000];
+        for f in old {
+            let f = f.as_ref().unwrap();
+            std::fs::remove_file(f.path()).unwrap();
+        }
+    }
+}
+
+fn do_loop() {
+    const EPOCHS: usize = 1;
+    const GAMES: usize = 1;
+    // let mut step = 0.0001;
+    loop {
+        reset_crit();
+        // todo!("Make partial reset to keep 500,000 images");
+        let mut p = std::process::Command::new("wine")
+            .arg("/home/opfromthestart/rust/game/touhou-ai/games/np2fmgen/np21nt.exe")
+            .spawn()
+            .unwrap();
+        gather_live_actor(GAMES, None, None);
+        // gather_live_actor(GAMES, Some(1.0), None);
+        p.kill().unwrap();
+        // process_crit(0.997);
+        // step = 0.8 / ((get_q_iter().len() / GAMES) as f64);
+        // train(Some(EPOCHS));
+        // train_actor(true, Some(EPOCHS));
+        train_q(Some(EPOCHS));
+    }
+}
+fn train_q(limit: Option<usize>) {
+    let mut q = NetQ::load_or_new("ai-file/th2_q.net"); //::<Backend<Cuda>>
+    let limit = limit.unwrap_or(2000);
+
+    let mut r = thread_rng();
+    let (mut outp, mut test) = get_q_iter().split_test(16000);
+    // let (mut outpa, mut testa) = get_actor_iter().split_test(16000);
+    let datasize = DATASIZE.unwrap_or(outp.len());
+    // let img = get_enc_batch(1, &mut r);
+    // let mut outp: Vec<Vec<f32>> = vec![net::to_pixels(&img[0])];
+    // let datasize = outp.len();
+    let mut acc_err;
+    let mut prev_err = f32::MIN;
+    let mut test_err;
+
+    // let (mut actor, critic, mut grad) = actor.pair_grad(critic);
+    let mut grad;
+
+    for epoch in 0..limit {
+        // eprint!("Loading images\r");
+        // if !SINGLE || epoch == 0 {
+        //     outp = get_enc_iter();
+        // }
+
+        let epoch_start = std::time::SystemTime::now();
+
+        acc_err = 0.0;
+
+        // let samples = outpc.len() / BACK_BATCH;
+
+        // if true {
+        //     for (i, img) in outp
+        //         .array_chunks::<BACK_BATCH>()
+        //         .enumerate()
+        //         .take(datasize / BACK_BATCH)
+        //     {
+        //         for imgb in img.array_chunks::<MEM_BATCH>() {
+        //             let imgb = imgb.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
+        //             (derr, grad) = actor.acc_grad::<MEM_BATCH>(&imgb, &critic, grad);
+        //             acc_err += derr;
+        //             // grad = net.backward(grad);
+        //             // acc_err += net.train_batch::<MEM_BATCH>(imgb);
+        //         }
+        //         grad = actor.backward(grad);
+
+        //         let est_remain = epoch_start
+        //             .elapsed()
+        //             .unwrap()
+        //             .div((i + 1) as u32)
+        //             .mul((datasize / BACK_BATCH - i - 1) as u32);
+
+        //         // let ao = actor.forward(img[0]);
+        //         // let co = critic.forward(img[0], &ao);
+        //         eprint!(
+        //             "{}/{datasize} Err: {} Remaining: {:?}  \r", // Result {ao:?} Score {co:?}
+        //             (i + 1) * BACK_BATCH,
+        //             acc_err / ((i + 1) * BACK_BATCH) as f32,
+        //             est_remain,
+        //         );
+        //     }
+        // }
+        test_err = 0.0;
+        for (i, img) in outp
+            .array_chunks::<BATCH>()
+            .enumerate()
+            .take(datasize / BATCH)
+        {
+            let imgb = img.iter().map(|x| &x.0 as &[f32]).collect::<Vec<_>>();
+            let keys = img.iter().map(|x| &x.1 as &[f32]).collect::<Vec<_>>();
+            let scores_ = img.iter().map(|x| vec![x.2]).collect::<Vec<_>>();
+            let scores = scores_.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
+
+            let imgnb = img
+                .iter()
+                .map(|x| x.3.as_ref().map(|a| a as &[f32]))
+                .collect::<Vec<_>>();
+            let (derr, grad2) = q.acc_grad::<BATCH>(&imgb, &keys, &scores, &imgnb, 0.995);
+            grad = Some(grad2);
+            acc_err += derr;
+            // grad = net.backward(grad);
+            // acc_err += net.train_batch::<MEM_BATCH>(imgb);
+
+            q.backward(grad.unwrap());
+            // grad = None;
+
+            let est_remain = epoch_start
+                .elapsed()
+                .unwrap()
+                .div((i + 1) as u32)
+                .mul((datasize / BATCH - i - 1) as u32);
+
+            // let ao = actor.forward(img[0]);
+            // let co = critic.forward(img[0], &ao);
+            eprint!(
+                "{:8}/{datasize:8} Err: {} Remaining: {:?}  \r", // Result {ao:?} Score {co:?}
+                (i + 1) * BATCH,
+                acc_err / ((i + 1) * BATCH) as f32,
+                est_remain,
+            );
+        }
+        for b in (&mut test).array_chunks::<BATCH>() {
+            let imgb = b.iter().map(|x| &x.0 as &[f32]).collect::<Vec<_>>();
+            let keys = b.iter().map(|x| &x.1 as &[f32]).collect::<Vec<_>>();
+            let scores_ = b.iter().map(|x| vec![x.2]).collect::<Vec<_>>();
+            let scores = scores_.iter().map(|x| x as &[f32]).collect::<Vec<_>>();
+
+            let imgnb = b
+                .iter()
+                .map(|x| x.3.as_ref().map(|a| a as &[f32]))
+                .collect::<Vec<_>>();
+            let (derr, _) = q.acc_grad::<BATCH>(&imgb, &keys, &scores, &imgnb, 0.995);
+            test_err += derr;
+        }
+        test_err /= test.len() as f32;
+        // println!("{:?}", actor.net.1 .0 .0.bias);
+        //grad = actor.backward(grad);
+        acc_err /= datasize as f32;
+        if prev_err < acc_err {
+            q.decay_lr(DECAY_RATE);
+        }
+        prev_err = acc_err;
+        // epoch += 1;
+        q.clear_grad();
+        eprintln!(
+            "Epoch:{epoch:4} Error:      {acc_err} TestErr: {test_err} LR: {}                           ",
+            q.get_lr()
+        );
+
+        if !acc_err.is_nan() && acc_err.is_finite() && epoch % 1 == 0 {
+            q.save("ai-file/th2_q.net").unwrap();
+            // test_encode(outp.last().cloned());
+        } else if acc_err.is_nan() || acc_err.is_infinite() {
+            eprintln!("Get [NaN|inf]ed lol.");
+            break;
+        }
+        if !SINGLE {
+            outp.reset();
+            outp.shuffle(&mut r);
+            test.reset();
+        }
+    }
+}
+fn test_q() {
+    let to_run = image::open("dbg_images/test img4.png").unwrap().to_rgb8();
+    let to_run_pix = net::to_pixels(&to_run);
+    let to_run4 = image::open("dbg_images/test img3.png").unwrap().to_rgb8();
+    let to_run4_pix = net::to_pixels(&to_run4);
+    let net = NetQ::load_or_new("ai-file/th2_q.net");
+    let best_bove = net.get_move(&to_run_pix);
+    eprint!("\t\t\t\t\t\t\tbest move nothing: {best_bove:?}");
+    let best_bove = net.forward(&to_run4_pix);
+    eprint!("best move stuff: {best_bove:?}");
+
+    // let to_run = image::open("dbg_images/test img2.png").unwrap().to_rgb8();
+    // let to_run_pix = net::to_pixels(&to_run);
+    //eprintln!("{:?}", to_run_pix)eprintln!("making net");
+    // let net = net::NetCrit::load_or_new("ai-file/th2_critic.net"); //::<Backend<Cuda>>
+    // let conv = net.do_conv(&to_run_pix);
+    // let t = conv
+    //     .iter()
+    //     .map(|x| x.iter().map(|x| x.abs()).sum::<f32>() / s)
+    //     .collect::<Vec<_>>();
+    // eprintln!("weight: {:?}", t);
+    // conv.into_iter()
+    //     .enumerate()
+    //     .map(|(i, p)| (to_rb(&p, (33, 53), true), i))
+    //     .for_each(|(x, i)| x.save(format!("dbg_images/post_conv{i}_2.png")).unwrap());
+
+    let now = SystemTime::now();
+    for _ in 0..1000 {
+        // println!("{:?}", net.forward(&to_run_pix, &keys));
+        // let start = Instant::now();
+        net.get_move(&to_run_pix);
+        // println!("{:?}", start.elapsed());
+    }
+    println!("net took {:?} for 1000", now.elapsed().unwrap());
+
+    // drop(net);
+    // let act = NetActor::load_or_new("ai-file/th2_actor.net");
+    // let now = SystemTime::now();
+    // for _ in 0..60 {
+    //     // println!("{:?}", net.forward(&to_run_pix, &keys));
+    //     // let start = Instant::now();
+    //     act.forward(&to_run_pix);
+    //     // println!("{:?}", start.elapsed());
+    // }
+    // println!("actor took {:?} for 60", now.elapsed().unwrap());
+
+    // let latent = net
+    //     .do_conv(&to_run_pix)
+    //     .into_iter()
+    //     .flatten()
+    //     .collect::<Vec<_>>();
+    // let now = SystemTime::now();
+    // for _ in 0..60 {
+    //     let lat = net.do_conv(&to_run_pix);
+    //     let out = net.from_conv(&lat.into_iter().flatten().collect::<Vec<_>>(), &keys);
+    //     // println!("{out:?}");
+    // }
+    // println!("Took {:?} for 60 decomp", now.elapsed().unwrap());
+
+    // let score = net.forward(&to_run_pix, &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    // eprintln!("Score: {score:?}");
+
+    // let bytes = std::fs::read("ai-file/1.0.bias").unwrap()[74..].to_vec();
+    // let l = bytes.len()/4;
+    // let floats : Vec<f32> = unsafe {
+    //     std::mem::transmute(bytes)
+    // };
+    // eprintln!("{:?}", &floats[..l]);
+    net.clear_grad();
 }

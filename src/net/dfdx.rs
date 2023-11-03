@@ -1,22 +1,27 @@
 use std::fmt::Display;
+use std::marker::PhantomData;
 use std::ops::Range;
+use std::sync::{Arc, Mutex};
 use std::{io::Read, path::Path};
 
 use dfdx::prelude::{
-    Bias2D, LeakyReLU, RecursiveWalker, Softmax, TensorCollection, TensorVisitor, ViewTensorRef,
+    Bias2D, LeakyReLU, NonMutableModule, RecursiveWalker, Softmax, TensorCollection, TensorVisitor,
+    ViewTensorRef, ZeroSizedModule,
 };
-use dfdx::shapes::{Axis, Rank0};
-use dfdx::tensor::{Merge, PutTape, SplitTape, Storage, Tape};
-use dfdx::tensor_ops::{MeanTo, NearestNeighbor, WeightDecay};
+use dfdx::shapes::{Axes, Axes3, Axis, Dtype, Rank0, ReduceShape, Shape};
+use dfdx::tensor::{PutTape, Storage, Tape};
+use dfdx::tensor_ops::{
+    huber_error, mul, BroadcastTo, Device, MaxTo, MeanTo, NearestNeighbor, WeightDecay,
+};
 use dfdx::tensor_ops::{SumTo, TryConcatAlong};
 use dfdx::{
-    optim::{Adam, AdamConfig, Optimizer, RMSprop, RMSpropConfig},
+    optim::{Adam, AdamConfig, Optimizer},
     prelude::{
-        mse_loss, AvgPool2D, BuildOnDevice, Conv2D, ConvTrans2D, DeviceBuildExt, Flatten2D, Linear,
-        LoadFromNpz, MaxPool2D, Module, ModuleMut, SaveToNpz, Upscale2D, Upscale2DBy, ZeroGrads,
+        mse_loss, AvgPool2D, BuildOnDevice, Conv2D, DeviceBuildExt, Flatten2D, Linear, LoadFromNpz,
+        MaxPool2D, Module, ModuleMut, SaveToNpz, Upscale2D, Upscale2DBy, ZeroGrads,
     },
     shapes::{Const, Rank2, Rank4},
-    tensor::{AsArray, Cuda, Gradients, NoneTape, OwnedTape, Tensor, TensorFromVec, Trace},
+    tensor::{AsArray, Cuda, Gradients, NoneTape, OwnedTape, Tensor, TensorFromVec},
     tensor_ops::{Backward, Bilinear},
 };
 
@@ -26,52 +31,126 @@ use rand::{thread_rng, Rng};
 
 use crate::arena;
 
-const LATENT_SIZE: usize = 10000;
+const LATENT_SIZE: usize = 2400;
 const INPUT_SIZE: usize = 32;
 const CRITIC_SIZE: usize = LATENT_SIZE + INPUT_SIZE;
-pub(crate) const LR: f64 = 0.0001;
-const MIDSIZE: usize = 1024 * 4;
+pub(crate) const LR: f64 = 0.000001;
+const MIDSIZE: usize = CRITIC_SIZE * 4;
 
 pub(crate) type NetDevice = Cuda;
 type Layer = LeakyReLU<f32>;
 type NormLayer = Softmax;
+pub(crate) type NetTape<E, D> = Arc<Mutex<OwnedTape<E, D>>>;
+
+pub(crate) struct Normalize<A: Axes> {
+    eps: f64,
+    a: PhantomData<A>,
+}
+
+impl<S: Shape + ReduceShape<A>, E: Dtype, D: Device<E>, T: Tape<E, D>, A: Axes>
+    Module<Tensor<S, E, D, T>> for Normalize<A>
+{
+    type Output = Tensor<S, E, D, T>;
+
+    type Error = D::Err;
+
+    fn try_forward(&self, input: Tensor<S, E, D, T>) -> Result<Self::Output, Self::Error> {
+        Ok(input.normalize::<A>(self.eps))
+    }
+}
+impl<A: Axes> NonMutableModule for Normalize<A> {}
+impl<A: Axes> ZeroSizedModule for Normalize<A> {}
+impl<A: Axes> Default for Normalize<A> {
+    fn default() -> Self {
+        Self {
+            eps: 0.00001,
+            a: PhantomData,
+        }
+    }
+}
 
 type NetConvCN = (
     AvgPool2D<2, 2, 0>,
     (
-        //     Dropout,
-        Conv2D<3, 20, 5, 1, 2>,
-        Bias2D<20>,
-        // PReLU1D<Const<20>>,
-        // LeakyReLU<f32>,
-        Layer,
+        (
+            Conv2D<3, 20, 5, 1, 2>,
+            Bias2D<20>,
+            // BatchNorm2D<10>,
+            // PReLU1D<Const<20>>,
+            // LeakyReLU<f32>,
+            Layer,
+        ),
+        (
+            Conv2D<20, 20, 1, 1, 0>,
+            Bias2D<20>,
+            // BatchNorm2D<10>,
+            // PReLU1D<Const<20>>,
+            // LeakyReLU<f32>,
+            Layer,
+        ),
         MaxPool2D<2, 2, 0>,
     ),
     (
-        //     Dropout,
-        Conv2D<20, 60, 3, 1, 1>,
-        Bias2D<60>,
-        // PReLU1D<Const<60>>,
-        // LeakyReLU<f32>,
-        Layer,
+        (
+            //     Dropout,
+            Conv2D<20, 60, 3, 1, 1>,
+            Bias2D<60>,
+            // BatchNorm2D<10>,
+            // PReLU1D<Const<60>>,
+            // LeakyReLU<f32>,
+            Layer,
+        ),
+        (
+            //     Dropout,
+            Conv2D<60, 60, 1, 1, 0>,
+            Bias2D<60>,
+            // BatchNorm2D<10>,
+            // PReLU1D<Const<60>>,
+            // LeakyReLU<f32>,
+            Layer,
+        ),
         MaxPool2D<2, 2, 0>,
     ),
     (
-        //     Dropout,
-        Conv2D<60, 60, 3, 1, 1>,
-        Bias2D<60>,
-        // PReLU1D<Const<60>>,
-        // LeakyReLU<f32>,
-        Layer,
-        // MaxPool2D<2, 2, 0>,
+        (
+            //     Dropout,
+            Conv2D<60, 60, 3, 1, 1>,
+            Bias2D<60>,
+            // BatchNorm2D<10>,
+            // PReLU1D<Const<60>>,
+            // LeakyReLU<f32>,
+            Layer,
+        ),
+        (
+            //     Dropout,
+            Conv2D<60, 60, 1, 1, 0>,
+            Bias2D<60>,
+            // BatchNorm2D<10>,
+            // PReLU1D<Const<60>>,
+            // LeakyReLU<f32>,
+            Layer,
+        ),
+        MaxPool2D<2, 2, 0>,
     ),
     (
-        //     Dropout,
-        Conv2D<60, 10, 3, 1, 1>,
-        Bias2D<10>,
-        // PReLU1D<Const<10>>,
-        // LeakyReLU<f32>,
-        Layer,
+        (
+            //     Dropout,
+            Conv2D<60, 60, 3, 1, 1>,
+            Bias2D<60>,
+            // BatchNorm2D<10>,
+            // PReLU1D<Const<60>>,
+            // LeakyReLU<f32>,
+            Layer,
+        ),
+        (
+            //     Dropout,
+            Conv2D<60, 10, 1, 1, 0>,
+            Bias2D<10>,
+            // BatchNorm2D<10>,
+            // PReLU1D<Const<60>>,
+            // LeakyReLU<f32>,
+            Layer,
+        ),
         MaxPool2D<2, 2, 0>,
     ),
     // (
@@ -96,55 +175,10 @@ type NetConvCN = (
     //     MaxPool2D<2, 2, 1>,
     // ),
     // Dropout,
+    Normalize<Axes3<1, 2, 3>>,
 );
 type NetConv = NetConvCN;
-#[allow(dead_code)]
-type NetConvTransCN = (
-    // (
-    //     // (
-    // //     //     // Dropout,
-    //     //     ConvTrans2D<32, 32, 3, 2, 2>,
-    //     //     Bias2D<32>,
-    //     //     PReLU1D<Const<32>>,
-    //     // ),
-    //     (
-    // //         // Dropout,
-    //         ConvTrans2D<32, 32, 3, 2, 2>,
-    //         Bias2D<32>,
-    //         PReLU1D<Const<32>>,
-    //     ),
-    // ),
-    // Upscale2DBy<2, 2, NearestNeighbor>,
-    (
-        //     Dropout,
-        Upscale2DBy<2, 2, NearestNeighbor>,
-        ConvTrans2D<8, 16, 3, 1, 1>,
-        Bias2D<16>,
-        PReLU1D<Const<16>>,
-    ),
-    (
-        //     Dropout,
-        Upscale2DBy<2, 2, NearestNeighbor>,
-        ConvTrans2D<16, 24, 3, 1, 1>,
-        Bias2D<24>,
-        PReLU1D<Const<24>>,
-    ),
-    (
-        //     Dropout,
-        Upscale2DBy<2, 2, NearestNeighbor>,
-        ConvTrans2D<24, 3, 5, 1, 0>,
-        Bias2D<3>,
-        PReLU1D<Const<3>>,
-    ),
-    // (
-    //     // Upscale2D<400, 640, Bilinear>,
-    // //     Dropout,
-    //     Conv2D<3, 3, 5, 1, 2>,
-    //     Bias2D<3>,
-    //     PReLU,
-    // ),
-    // Upscale2DBy<4, 4, Bilinear>,
-);
+
 type NetConvTransCUp = (
     // (
     //     (
@@ -224,37 +258,56 @@ type NetConvTransC = NetConvTransCUp;
 type NetConvTrans = NetConvTransC;
 type NetLinCrit = (
     (Linear<CRITIC_SIZE, MIDSIZE>, Layer),
-    (Linear<MIDSIZE, MIDSIZE>, Layer),
+    // (Linear<MIDSIZE, MIDSIZE>, Layer),
     Linear<MIDSIZE, 1>,
+    Layer,
 );
 type NetLinActor = (
     (Linear<LATENT_SIZE, MIDSIZE>, Layer),
-    (Linear<MIDSIZE, MIDSIZE>, Layer),
+    // (Linear<MIDSIZE, MIDSIZE>, Layer),
     (Linear<MIDSIZE, INPUT_SIZE>, NormLayer),
+);
+type NetLinQ = (
+    (Linear<LATENT_SIZE, MIDSIZE>, Layer),
+    // (Linear<MIDSIZE, MIDSIZE>, Layer),
+    Linear<MIDSIZE, INPUT_SIZE>,
 );
 
 type NetAutoModel = (NetConv, NetConvTrans);
 type NetCritModel = (NetConv, NetLinCrit);
 type NetActorModel = (NetConv, NetLinActor);
+type NetQModel = (NetConv, NetLinQ);
 #[allow(dead_code)]
 type NetCritLearn = NetCritModel;
+type NetActorLearn = NetActorModel;
 
 pub(crate) struct NetAutoEncode {
     dev: NetDevice,
     pub(crate) net: <NetAutoModel as BuildOnDevice<NetDevice, f32>>::Built,
     pub(crate) optim: Adam<<NetAutoModel as BuildOnDevice<NetDevice, f32>>::Built, f32, NetDevice>,
+    grad: NetTape<f32, NetDevice>,
 }
 
 pub(crate) struct NetCrit {
-    dev: NetDevice,
+    pub(crate) dev: NetDevice,
     pub(crate) net: <NetCritModel as BuildOnDevice<NetDevice, f32>>::Built,
-    optim: RMSprop<<NetCritModel as BuildOnDevice<NetDevice, f32>>::Built, f32, NetDevice>,
+    optim: Adam<<NetCritLearn as BuildOnDevice<NetDevice, f32>>::Built, f32, NetDevice>,
+    grad: NetTape<f32, NetDevice>,
 }
 
 pub(crate) struct NetActor {
-    dev: NetDevice,
+    pub(crate) dev: NetDevice,
     pub(crate) net: <NetActorModel as BuildOnDevice<NetDevice, f32>>::Built,
-    optim: Adam<<NetActorModel as BuildOnDevice<NetDevice, f32>>::Built, f32, NetDevice>,
+    optim: Adam<<NetActorLearn as BuildOnDevice<NetDevice, f32>>::Built, f32, NetDevice>,
+    grad: NetTape<f32, NetDevice>,
+}
+
+fn make_config(lr: f64) -> AdamConfig {
+    AdamConfig {
+        lr,
+        weight_decay: Some(WeightDecay::Decoupled(1.0)),
+        ..Default::default()
+    }
 }
 
 #[allow(dead_code)]
@@ -279,13 +332,8 @@ impl NetCrit {
         // net.1 .0 .1.p = 0.2;
         // net.1 .1 .1.p = 0.2;
         Self {
-            optim: RMSprop::new(
-                &net,
-                RMSpropConfig {
-                    lr: LR,
-                    ..Default::default()
-                },
-            ),
+            optim: Adam::new(&net, make_config(LR)),
+            grad: Arc::new(Mutex::new(net.alloc_grads().into())),
             net,
             dev,
         }
@@ -317,13 +365,8 @@ impl NetCrit {
         // net.1 .0 .1.p = 0.2;
         // net.1 .1 .1.p = 0.2;
         Some(Self {
-            optim: RMSprop::new(
-                &net,
-                RMSpropConfig {
-                    lr,
-                    ..Default::default()
-                },
-            ),
+            optim: Adam::new(&net, make_config(lr)),
+            grad: Arc::new(Mutex::new(net.alloc_grads().into())),
             net,
             dev,
         })
@@ -346,13 +389,8 @@ impl NetCrit {
         // net.1 .0 .1.p = 0.2;
         // net.1 .1 .1.p = 0.2;
         Ok(Self {
-            optim: RMSprop::new(
-                &net,
-                RMSpropConfig {
-                    lr: LR,
-                    ..Default::default()
-                },
-            ),
+            optim: Adam::new(&net, make_config(LR)),
+            grad: Arc::new(Mutex::new(net.alloc_grads().into())),
             net,
             dev,
         })
@@ -373,23 +411,27 @@ impl NetCrit {
             .dev
             .tensor_from_vec(keys.to_vec(), (Const::<1>, Const::<INPUT_SIZE>));
 
-        let out = self.forward_raw(img, keys);
+        let out = self.forward_raw(
+            img.put_tape(self.grad.clone()),
+            keys.put_tape(self.grad.clone()),
+        );
 
         out.as_vec()
     }
 
-    fn forward_raw<const BATCH: usize, T: Tape<f32, NetDevice> + Merge<NoneTape>>(
+    fn forward_raw<const BATCH: usize>(
         &self,
-        img: Tensor<Rank4<BATCH, 3, 400, 640>, f32, NetDevice, T>,
-        keys: Tensor<Rank2<BATCH, 32>, f32, NetDevice, NoneTape>,
-    ) -> Tensor<Rank2<BATCH, 1>, f32, NetDevice, T> {
+        img: Tensor<Rank4<BATCH, 3, 400, 640>, f32, NetDevice, NetTape<f32, NetDevice>>,
+        keys: Tensor<Rank2<BATCH, 32>, f32, NetDevice, NetTape<f32, NetDevice>>,
+    ) -> Tensor<Rank2<BATCH, 1>, f32, NetDevice, NetTape<f32, NetDevice>> {
         let out_conv = self.net.0.forward(img);
-        let in_conv: Tensor<(Const<BATCH>, Const<10000>), _, _, _> = Flatten2D.forward(out_conv);
+        let in_conv: Tensor<(Const<BATCH>, Const<2400>), _, _, _> = Flatten2D.forward(out_conv);
+        // let in_conv: Tensor<(_, Const<2400>), _, _, _> = in_conv;
         // let (a, t) = in_conv.split_tape();
         // let conv_v = a.as_vec();
         // let key_v = keys.as_vec();
         // let lin_v = conv_v
-        //     .chunks_exact(10000)
+        //     .chunks_exact(LATENT_SIZE)
         //     .zip(key_v.chunks_exact(6))
         //     .map(|(a, b)| {
         //         let mut a = a.to_vec();
@@ -401,18 +443,19 @@ impl NetCrit {
         // let in_lin = dev
         //     .tensor_from_vec(lin_v, (Const::<BATCH>, Const::<10032>))
         //     .put_tape(t);
-        let in_lin = (in_conv, keys).concat_along(Axis::<1>);
+        let in_lin: Tensor<(Const<BATCH>, Const<CRITIC_SIZE>), _, _, _> =
+            (in_conv, keys).concat_along(Axis::<1>);
         let out = self.net.1.forward(in_lin);
         out
     }
 
     fn forward_raw_mut<const BATCH: usize>(
         &mut self,
-        img: Tensor<Rank4<BATCH, 3, 400, 640>, f32, NetDevice, OwnedTape<f32, NetDevice>>,
-        keys: Tensor<Rank2<BATCH, 32>, f32, NetDevice, NoneTape>,
-    ) -> Tensor<Rank2<BATCH, 1>, f32, NetDevice, OwnedTape<f32, NetDevice>> {
+        img: Tensor<Rank4<BATCH, 3, 400, 640>, f32, NetDevice, NetTape<f32, NetDevice>>,
+        keys: Tensor<Rank2<BATCH, 32>, f32, NetDevice, NetTape<f32, NetDevice>>,
+    ) -> Tensor<Rank2<BATCH, 1>, f32, NetDevice, NetTape<f32, NetDevice>> {
         let out_conv = self.net.0.forward_mut(img);
-        let in_conv: Tensor<(Const<BATCH>, Const<10000>), _, _, _> = Flatten2D.forward(out_conv);
+        let in_conv: Tensor<(Const<BATCH>, Const<2400>), _, _, _> = Flatten2D.forward(out_conv);
         let in_lin = (in_conv, keys).concat_along(Axis::<1>);
         let out = self.net.1.forward_mut(in_lin);
         out
@@ -434,7 +477,7 @@ impl NetCrit {
     pub(crate) fn from_conv(&self, conv: &[f32], keys: &[f32]) -> Vec<f32> {
         let mut iv = conv.to_vec();
         iv.extend_from_slice(keys);
-        let conv: Tensor<Rank2<1, 10032>, _, _> = self
+        let conv: Tensor<Rank2<1, CRITIC_SIZE>, _, _> = self
             .dev
             .tensor_from_vec(iv, (Const::<1>, Const::<CRITIC_SIZE>));
         let out = self.net.1.forward(conv);
@@ -442,13 +485,9 @@ impl NetCrit {
     }
 
     pub(crate) fn train(&mut self, img: &[f32], keys: &[f32], out: &[f32]) -> f32 {
-        let grads = self.net.alloc_grads();
-
-        let (r, _) = self.train_grad::<1>(&[img], &[keys], &[out], grads);
+        self.train_grad::<1>(&[img], &[keys], &[out])
 
         //self.net.zero_grads(&mut grads);
-
-        r
     }
 
     pub(crate) fn train_batch<const BATCH: usize>(
@@ -457,13 +496,9 @@ impl NetCrit {
         keys: &[&[f32]],
         out: &[&[f32]],
     ) -> f32 {
-        let grads = self.net.alloc_grads();
-
-        let (r, _) = self.train_grad::<BATCH>(img, keys, out, grads);
+        self.train_grad::<BATCH>(img, keys, out)
 
         //self.net.zero_grads(&mut grads);
-
-        r
     }
 
     pub(crate) fn train_grad<const SS: usize>(
@@ -471,13 +506,13 @@ impl NetCrit {
         img: &[&[f32]],
         keys: &[&[f32]],
         out: &[&[f32]],
-        grad: Gradients<f32, NetDevice>,
-    ) -> (f32, Gradients<f32, NetDevice>) {
-        let (r, g) = self.acc_grad::<SS>(img, keys, out, grad);
+    ) -> f32 {
+        let (r, g) = self.acc_grad::<SS>(img, keys, out);
         // let s = g.get_ref_checked(&self.net.0 .1 .0.weight).unwrap();
         // let v = &s.device().dtoh_sync_copy(s.deref()).unwrap();
         // dbg!(&v[0..10]);
-        (r, self.backward(g))
+        self.backward(g);
+        r
     }
 
     pub(crate) fn acc_grad<const SS: usize>(
@@ -485,7 +520,6 @@ impl NetCrit {
         img: &[&[f32]],
         keys: &[&[f32]],
         out: &[&[f32]],
-        mut grad: Gradients<f32, NetDevice>,
     ) -> (f32, Gradients<f32, NetDevice>) {
         let img = self.dev.tensor_from_vec(
             img.iter().map(|&x| x).flatten().cloned().collect(),
@@ -496,7 +530,10 @@ impl NetCrit {
             (Const::<SS>, Const::<32>),
         );
 
-        let model_out = self.forward_raw_mut(img.traced(grad), keys);
+        let model_out = self.forward_raw_mut(
+            img.put_tape(self.grad.clone()),
+            keys.put_tape(self.grad.clone()),
+        );
         let out = self.dev.tensor_from_vec(
             out.iter().map(|&x| x).flatten().cloned().collect(),
             (Const::<SS>, Const::<1>),
@@ -508,27 +545,15 @@ impl NetCrit {
         let r = err.as_vec()[0];
         //dbg!(mo, ou, r);
 
-        grad = err.backward();
-
-        (r, grad)
+        (r, err.backward())
     }
 
-    pub(crate) fn backward(
-        &mut self,
-        mut grad: Gradients<f32, NetDevice>,
-    ) -> Gradients<f32, NetDevice> {
+    pub(crate) fn backward(&mut self, grad: Gradients<f32, NetDevice>) {
         // let s = grad.get_ref_checked(&self.net.0 .1 .0.weight).unwrap();
         // let v = &s.device().dtoh_sync_copy(s.deref()).unwrap();
         // dbg!(&v[0..10]);
         self.optim.update(&mut self.net, &grad).unwrap();
-
-        self.net.zero_grads(&mut grad);
-
-        grad
-    }
-
-    pub(crate) fn grad(&self) -> Gradients<f32, NetDevice> {
-        self.net.alloc_grads()
+        self.clear_grad();
     }
 
     pub(crate) fn decay_lr(&mut self, factor: f64) {
@@ -537,6 +562,17 @@ impl NetCrit {
 
     pub(crate) fn get_lr(&self) -> f64 {
         self.optim.cfg.lr
+    }
+
+    pub(crate) fn clear_grad(&self) {
+        let t = self
+            .dev
+            .tensor_from_vec(vec![0.], ())
+            .put_tape(self.grad.clone());
+        let mut grad = t.backward();
+        self.net.zero_grads(&mut grad);
+        grad.drop_non_leafs();
+        *self.grad.lock().unwrap() = grad.into();
     }
 }
 #[allow(dead_code)]
@@ -563,13 +599,8 @@ impl NetAutoEncode {
         // net.1 .2 .0.p = 0.0;
         // net.1 .3 .5.p = 0.0;
         Self {
-            optim: Adam::new(
-                &net,
-                AdamConfig {
-                    lr: LR,
-                    ..Default::default()
-                },
-            ),
+            optim: Adam::new(&net, make_config(LR)),
+            grad: Arc::new(Mutex::new(net.alloc_grads().into())),
             net,
             dev,
         }
@@ -626,8 +657,8 @@ impl NetAutoEncode {
 
     fn forward_raw_mut<const BATCH: usize>(
         &mut self,
-        img: Tensor<Rank4<BATCH, 3, 400, 640>, f32, NetDevice, OwnedTape<f32, NetDevice>>,
-    ) -> Tensor<Rank4<BATCH, 3, 400, 640>, f32, NetDevice, OwnedTape<f32, NetDevice>> {
+        img: Tensor<Rank4<BATCH, 3, 400, 640>, f32, NetDevice, NetTape<f32, NetDevice>>,
+    ) -> Tensor<Rank4<BATCH, 3, 400, 640>, f32, NetDevice, NetTape<f32, NetDevice>> {
         // let out_conv = self.net.0 .0.forward_mut(img);
         // let out_conv = self.net.0 .1.forward_mut(out_conv);
         // let out_lin = self
@@ -642,30 +673,18 @@ impl NetAutoEncode {
     }
 
     pub(crate) fn train(&mut self, img: &[f32]) -> f32 {
-        let grads = self.net.alloc_grads();
-
-        let (r, _) = self.train_grad::<1>(&[img], grads);
+        self.train_grad::<1>(&[img])
 
         //self.net.zero_grads(&mut grads);
-
-        r
     }
 
     pub(crate) fn train_batch<const BATCH: usize>(&mut self, img: &[&[f32]]) -> f32 {
-        let grads = self.net.alloc_grads();
-
-        let (r, _) = self.train_grad::<BATCH>(img, grads);
+        self.train_grad::<BATCH>(img)
 
         //self.net.zero_grads(&mut grads);
-
-        r
     }
 
-    pub(crate) fn train_grad<const SS: usize>(
-        &mut self,
-        img: &[&[f32]],
-        mut grad: Gradients<f32, NetDevice>,
-    ) -> (f32, Gradients<f32, NetDevice>) {
+    pub(crate) fn train_grad<const SS: usize>(&mut self, img: &[&[f32]]) -> f32 {
         let out = self.dev.tensor_from_vec(
             img.iter().map(|&x| x).flatten().cloned().collect(),
             (Const::<SS>, Const::<3>, Const::<400>, Const::<640>),
@@ -675,7 +694,7 @@ impl NetAutoEncode {
             (Const::<SS>, Const::<3>, Const::<400>, Const::<640>),
         );
 
-        let model_out = self.forward_raw_mut(img.traced(grad));
+        let model_out = self.forward_raw_mut(img.put_tape(self.grad.clone()));
         //let mo = model_out.as_vec()[0];
         //let ou = out.as_vec()[0];
 
@@ -683,7 +702,7 @@ impl NetAutoEncode {
         let r = err.as_vec()[0];
         //dbg!(mo, ou, r);
 
-        grad = err.backward();
+        let mut grad = err.backward();
 
         // println!("{:?}", grad.get(&self.net.0.0.1.0.weight).as_vec().into_iter().reduce(|x,y| x.abs() + y.abs()));
         // println!("{:?}", grad.get(&self.net.1.1.3.3.a).as_vec().into_iter().reduce(|x,y| x.abs() + y.abs()));
@@ -693,14 +712,15 @@ impl NetAutoEncode {
         self.optim.update(&mut self.net, &grad).unwrap();
 
         self.net.zero_grads(&mut grad);
+        grad.drop_non_leafs();
+        *self.grad.lock().unwrap() = grad.into();
 
-        (r, grad)
+        r
     }
 
     pub(crate) fn acc_grad<const SS: usize>(
         &mut self,
         img: &[&[f32]],
-        mut grad: Gradients<f32, NetDevice>,
     ) -> (f32, Gradients<f32, NetDevice>) {
         let out = self.dev.tensor_from_vec(
             img.iter().map(|&x| x).flatten().cloned().collect(),
@@ -711,7 +731,7 @@ impl NetAutoEncode {
             (Const::<SS>, Const::<3>, Const::<400>, Const::<640>),
         );
 
-        let model_out = self.forward_raw_mut(img.traced(grad));
+        let model_out = self.forward_raw_mut(img.put_tape(self.grad.clone()));
         //let mo = model_out.as_vec()[0];
         //let ou = out.as_vec()[0];
 
@@ -719,7 +739,7 @@ impl NetAutoEncode {
         let r = err.as_vec()[0];
         //dbg!(mo, ou, r);
 
-        grad = err.backward();
+        let grad = err.backward();
 
         (r, grad)
     }
@@ -833,14 +853,8 @@ impl NetActor {
         // net.1 .0 .1.p = 0.2;
         // net.1 .1 .1.p = 0.2;
         Self {
-            optim: Adam::new(
-                &net,
-                AdamConfig {
-                    lr: LR,
-                    weight_decay: Some(WeightDecay::L2(0.1)),
-                    ..Default::default()
-                },
-            ),
+            optim: Adam::new(&net, make_config(LR)),
+            grad: Arc::new(Mutex::new(net.alloc_grads().into())),
             net,
             dev,
         }
@@ -872,14 +886,8 @@ impl NetActor {
         // net.1 .0 .1.p = 0.2;
         // net.1 .1 .1.p = 0.2;
         Some(Self {
-            optim: Adam::new(
-                &net,
-                AdamConfig {
-                    lr,
-                    weight_decay: Some(WeightDecay::L2(0.1)),
-                    ..Default::default()
-                },
-            ),
+            optim: Adam::new(&net, make_config(lr)),
+            grad: Arc::new(Mutex::new(net.alloc_grads().into())),
             net,
             dev,
         })
@@ -902,14 +910,31 @@ impl NetActor {
         // net.1 .0 .1.p = 0.2;
         // net.1 .1 .1.p = 0.2;
         Ok(Self {
-            optim: Adam::new(
-                &net,
-                AdamConfig {
-                    lr: LR,
-                    weight_decay: Some(WeightDecay::L2(0.1)),
-                    ..Default::default()
-                },
-            ),
+            optim: Adam::new(&net, make_config(LR)),
+            grad: Arc::new(Mutex::new(net.alloc_grads().into())),
+            net,
+            dev,
+        })
+    }
+    pub(crate) fn load_from_critic<P: AsRef<Path>>(p: P, crit_p: P) -> Result<Self, String> {
+        let dev = NetDevice::default();
+
+        let mut net_crit = dev.build_module::<NetCritModel, f32>();
+        net_crit
+            .load(crit_p.as_ref())
+            .map_err(|x| format!("Encoder: {}", x))?;
+        let mut net = dev.build_module::<NetActorModel, _>();
+        let _ = net.load(p.as_ref()); // ignore since it could be empty.
+        net.0 = net_crit.0;
+        // net.0.0.1.0.p = 0.2;
+        // net.0.0.2.0.p = 0.2;
+        // net.0.0.3.0.p = 0.2;
+        // net.0.0.4.p = 0.2;
+        // net.1 .0 .1.p = 0.2;
+        // net.1 .1 .1.p = 0.2;
+        Ok(Self {
+            optim: Adam::new(&net, make_config(LR)),
+            grad: Arc::new(Mutex::new(net.alloc_grads().into())),
             net,
             dev,
         })
@@ -938,17 +963,19 @@ impl NetActor {
         img: Tensor<Rank4<BATCH, 3, 400, 640>, f32, NetDevice, NoneTape>,
     ) -> Tensor<Rank2<BATCH, INPUT_SIZE>, f32, NetDevice, NoneTape> {
         let out_conv = self.net.0.forward(img);
-        let in_conv: Tensor<(Const<BATCH>, Const<10000>), _, _, _> = Flatten2D.forward(out_conv);
+        let in_conv: Tensor<(Const<BATCH>, Const<LATENT_SIZE>), _, _, _> =
+            Flatten2D.forward(out_conv);
         let out = self.net.1.forward(in_conv);
         out
     }
 
     fn forward_raw_mut<const BATCH: usize>(
         &mut self,
-        img: Tensor<Rank4<BATCH, 3, 400, 640>, f32, NetDevice, OwnedTape<f32, NetDevice>>,
-    ) -> Tensor<Rank2<BATCH, 32>, f32, NetDevice, OwnedTape<f32, NetDevice>> {
+        img: Tensor<Rank4<BATCH, 3, 400, 640>, f32, NetDevice, NetTape<f32, NetDevice>>,
+    ) -> Tensor<Rank2<BATCH, 32>, f32, NetDevice, NetTape<f32, NetDevice>> {
         let out_conv = self.net.0.forward_mut(img);
-        let in_conv: Tensor<(Const<BATCH>, Const<10000>), _, _, _> = Flatten2D.forward(out_conv);
+        let in_conv: Tensor<(Const<BATCH>, Const<LATENT_SIZE>), _, _, _> =
+            Flatten2D.forward(out_conv);
         // let in_lin = (in_conv, keys).concat_along(Axis::<1>);
         let out = self.net.1.forward_mut(in_conv);
         out
@@ -971,21 +998,25 @@ impl NetActor {
         &mut self,
         img: &[&[f32]],
         critic: &NetCrit,
-        mut grad: Gradients<f32, NetDevice>,
     ) -> (f32, Gradients<f32, NetDevice>) {
         let img = self.dev.tensor_from_vec(
             img.iter().map(|&x| x).flatten().cloned().collect(),
             (Const::<SS>, Const::<3>, Const::<400>, Const::<640>),
         );
         // grad.try_alloc_for(&critic.net);
-        let model_out = self.forward_raw_mut(img.clone().traced(grad));
-        let (m, g) = model_out.split_tape();
+        let enc = self.net.0.forward(img);
+        let enc_flat: Tensor<(Const<SS>, Const<2400>), _, _, _> = Flatten2D.forward(enc);
+        let model_out = self
+            .net
+            .1
+            .forward_mut(enc_flat.clone().put_tape(self.grad.clone()));
         // let mc = m.clone();
         // let mcc = mc.clone();
         // let expand = (-mc.put_tape(g).clamp(0.0, 1.0) + mcc).abs();
         // let expand = expand.put_tape(g);
         // let (expand, g) = expand.split_tape();
-        let crit_out = critic.forward_raw(img.put_tape(g), m);
+        let crit_enc = (enc_flat.put_tape(self.grad.clone()), model_out).concat_along(Axis::<1>);
+        let out = critic.net.1.forward(crit_enc);
         // let (crit_out, g) = crit_out.split_tape();
         // let out = dev.tensor_from_vec(
         // crit_out.iter().map(|&x| x).flatten().cloned().collect(),
@@ -994,15 +1025,17 @@ impl NetActor {
         //let mo = model_out.as_vec()[0];
         //let ou = out.as_vec()[0];
 
-        let err: Tensor<Rank0, f32, NetDevice, _> = crit_out.mean(); // - crit_out.sum()
+        let avg_score = out.mean();
+        let r = avg_score.array();
+        let err: Tensor<Rank0, f32, NetDevice, _> = -avg_score; // - crit_out.sum()
 
         // let (ent, tape) = err.split_tape();
         // let e2 = ent.clone();
         // let err = ent.put_tape(tape);
-        let r = -err.as_vec()[0];
+        // let r = -err.array();
         //dbg!(mo, ou, r);
 
-        grad = err.backward();
+        let grad = err.backward();
 
         // let s = grad.get_ref_checked(&self.net.0 .1 .0.weight).unwrap();
 
@@ -1018,8 +1051,6 @@ impl NetActor {
         img: &[&[f32]],
         keys: &[&[f32]],
         out: &[&[f32]],
-
-        mut grad: Gradients<f32, NetDevice>,
     ) -> (f32, Gradients<f32, NetDevice>) {
         let img = self.dev.tensor_from_vec(
             img.iter().map(|&x| x).flatten().cloned().collect(),
@@ -1033,42 +1064,38 @@ impl NetActor {
             out.iter().map(|&x| x).flatten().cloned().collect(),
             (Const::<SS>,),
         );
-        let model_out = self.forward_raw_mut(img.traced(grad));
+        let model_out = self.forward_raw_mut(img.put_tape(self.grad.clone()));
         let key_dist = (model_out - keys).powi(2).sum::<(Const<SS>,), _>();
         let scale_score = dfdx::tensor_ops::mul(key_dist, out);
         let err = scale_score.mean();
         let r = err.array();
-        grad = err.backward();
+        let grad = err.backward();
         (r, grad)
     }
-    pub(crate) fn backward(
-        &mut self,
-        mut grad: Gradients<f32, NetDevice>,
-    ) -> Gradients<f32, NetDevice> {
+    pub(crate) fn backward(&mut self, mut grad: Gradients<f32, NetDevice>) {
         // let s = grad.get_ref_checked(&self.net.0 .1 .0.weight).unwrap();
 
         // let v = &s.device().dtoh_sync_copy(s.deref()).unwrap();
         // dbg!(&v[0..10]);
-        clamp_grad(&mut grad, &self.net);
+
+        // TODO this is important
+        // clamp_grad(&mut grad, &self.net);
+
         // let s = grad.get_ref_checked(&self.net.0 .1 .0.weight).unwrap();
 
         // let v = &s.device().dtoh_sync_copy(s.deref()).unwrap();
         // dbg!(&v[0..10]);
+
         self.optim.update(&mut self.net, &grad).unwrap();
 
         self.net.zero_grads(&mut grad);
-
-        grad
+        grad.drop_non_leafs();
+        *self.grad.lock().unwrap() = grad.into();
     }
 
-    pub(crate) fn train_grad<const SS: usize>(
-        &mut self,
-        img: &[&[f32]],
-        critic: &NetCrit,
-        grad: Gradients<f32, NetDevice>,
-    ) -> (f32, Gradients<f32, NetDevice>) {
-        let (r, g) = self.acc_grad::<SS>(img, critic, grad);
-        (r, self.backward(g))
+    pub(crate) fn train_grad<const SS: usize>(&mut self, img: &[&[f32]], critic: &NetCrit) -> f32 {
+        let (r, _) = self.acc_grad::<SS>(img, critic);
+        r
     }
     pub(crate) fn grad(&self) -> Gradients<f32, NetDevice> {
         self.net.alloc_grads()
@@ -1089,6 +1116,16 @@ impl NetActor {
 
     pub(crate) fn get_lr(&self) -> f64 {
         self.optim.cfg.lr
+    }
+    pub(crate) fn clear_grad(&self) {
+        let t = self
+            .dev
+            .tensor_from_vec(vec![0.], ())
+            .put_tape(self.grad.clone());
+        let mut grad = t.backward();
+        self.net.zero_grads(&mut grad);
+        grad.drop_non_leafs();
+        *self.grad.lock().unwrap() = grad.into();
     }
 }
 
@@ -1124,6 +1161,7 @@ impl<'a> TensorVisitor<f32, Cuda> for ClampVisitor<'a, Cuda> {
         Ok(None)
     }
 }
+#[allow(dead_code)]
 fn clamp_grad<T: TensorCollection<f32, Cuda>>(grad: &mut Gradients<f32, Cuda>, t: &T) {
     T::iter_tensors(&mut RecursiveWalker {
         m: t,
@@ -1176,17 +1214,309 @@ pub(crate) fn from_flat(flat: &[f32]) -> Vec<f32> {
     }
     keys
 }
-pub(crate) fn collapse(flat: &[f32]) -> Vec<f32> {
+pub(crate) fn collapse(flat: &[f32], explore: f32) -> Vec<f32> {
+    let mut r = thread_rng();
+    let mut rv = vec![0.0; 32];
+    if r.gen::<f32>() < explore {
+        rv[r.gen_range(0..32)] = 1.0;
+        return rv;
+    }
     let sum = flat.iter().sum::<f32>();
-    let rn = thread_rng().gen_range(0f32..sum);
+    let rn = r.gen_range(0f32..sum);
     let mut acc = 0.0;
     for (i, v) in flat.iter().enumerate() {
         acc += v;
         if acc >= rn {
-            let mut rv = vec![0.0; 32];
             rv[i] = 1.0;
             return rv;
         }
     }
     panic!("Something failed to add up");
+}
+
+pub(crate) struct NetQ {
+    net: <NetQModel as BuildOnDevice<NetDevice, f32>>::Built,
+    optim: Adam<<NetQModel as BuildOnDevice<NetDevice, f32>>::Built, f32, NetDevice>,
+    grad: Arc<Mutex<OwnedTape<f32, NetDevice>>>,
+    dev: NetDevice,
+}
+impl NetQ {
+    pub(crate) fn load_or_new<P: AsRef<Path>>(p: P) -> Self {
+        let dev = NetDevice::default();
+
+        let mut net = dev.build_module::<NetQModel, f32>();
+        let res = net.load(p.as_ref());
+        let loaded = res.is_ok();
+        if !loaded {
+            eprintln!("Made new, {res:?}");
+            // net.reset_params();
+        }
+        // net.0.0.1.0.p = 0.2;
+        // net.0.0.2.0.p = 0.2;
+        // net.0.0.3.0.p = 0.2;
+        // net.0.0.4.p = 0.2;
+        // net.1.0.1.p = 0.2;
+        // net.1.1.1.p = 0.2;
+        // net.1.3.p = 0.2;
+        // net.1 .0 .1.p = 0.2;
+        // net.1 .1 .1.p = 0.2;
+        Self {
+            optim: Adam::new(&net, make_config(LR)),
+            grad: Arc::new(Mutex::new(net.alloc_grads().into())),
+            net,
+            dev,
+        }
+    }
+
+    pub(crate) fn load<P: AsRef<Path> + Display>(p: P) -> Option<Self> {
+        let dev = NetDevice::default();
+
+        let mut net = dev.build_module::<NetQModel, f32>();
+        let res = net.load(p.as_ref());
+        let loaded = res.is_ok();
+        if !loaded {
+            return None;
+        }
+        let lr: f64 = std::fs::read_to_string(format!("{p}.lr"))
+            .map_err(|x| eprintln!("{x:?}"))
+            .ok()?
+            .trim()
+            .parse()
+            .map_err(|x| eprintln!("{x:?}"))
+            .ok()?;
+        // net.0.0.1.0.p = 0.2;
+        // net.0.0.2.0.p = 0.2;
+        // net.0.0.3.0.p = 0.2;
+        // net.0.0.4.p = 0.2;
+        // net.1.0.1.p = 0.2;
+        // net.1.1.1.p = 0.2;
+        // net.1.3.p = 0.2;
+        // net.1 .0 .1.p = 0.2;
+        // net.1 .1 .1.p = 0.2;
+        Some(Self {
+            optim: Adam::new(&net, make_config(lr)),
+            grad: Arc::new(Mutex::new(net.alloc_grads().into())),
+            net,
+            dev,
+        })
+    }
+
+    pub(crate) fn load_from_encode<P: AsRef<Path>>(p: P, enc_p: P) -> Result<Self, String> {
+        let dev = NetDevice::default();
+
+        let mut net_enc = dev.build_module::<NetAutoModel, f32>();
+        net_enc
+            .load(enc_p.as_ref())
+            .map_err(|x| format!("Encoder: {}", x))?;
+        let mut net = dev.build_module::<NetQModel, _>();
+        let _ = net.load(p.as_ref()); // ignore since it could be empty.
+        net.0 = net_enc.0;
+        // net.0.0.1.0.p = 0.2;
+        // net.0.0.2.0.p = 0.2;
+        // net.0.0.3.0.p = 0.2;
+        // net.0.0.4.p = 0.2;
+        // net.1 .0 .1.p = 0.2;
+        // net.1 .1 .1.p = 0.2;
+        Ok(Self {
+            optim: Adam::new(&net, make_config(LR)),
+            grad: Arc::new(Mutex::new(net.alloc_grads().into())),
+            net,
+            dev,
+        })
+    }
+    pub(crate) fn load_from_critic<P: AsRef<Path>>(p: P, crit_p: P) -> Result<Self, String> {
+        let dev = NetDevice::default();
+
+        let mut net_crit = dev.build_module::<NetCritModel, f32>();
+        net_crit
+            .load(crit_p.as_ref())
+            .map_err(|x| format!("Encoder: {}", x))?;
+        let mut net = dev.build_module::<NetQModel, _>();
+        let _ = net.load(p.as_ref()); // ignore since it could be empty.
+        net.0 = net_crit.0;
+        // net.0.0.1.0.p = 0.2;
+        // net.0.0.2.0.p = 0.2;
+        // net.0.0.3.0.p = 0.2;
+        // net.0.0.4.p = 0.2;
+        // net.1 .0 .1.p = 0.2;
+        // net.1 .1 .1.p = 0.2;
+        Ok(Self {
+            optim: Adam::new(&net, make_config(LR)),
+            grad: Arc::new(Mutex::new(net.alloc_grads().into())),
+            net,
+            dev,
+        })
+    }
+
+    pub(crate) fn save<P: AsRef<Path> + Display>(&mut self, p: P) -> Result<(), std::io::Error> {
+        self.net.save(p.as_ref())?;
+        std::fs::write(format!("{p}.lr"), format!("{}", self.optim.cfg.lr))?;
+        Ok(())
+    }
+
+    pub(crate) fn forward(&self, img: &[f32]) -> Vec<f32> {
+        let img = self.dev.tensor_from_vec(
+            img.to_vec(),
+            (Const::<1>, Const::<3>, Const::<400>, Const::<640>),
+        );
+        // let keys = dev.tensor_from_vec(keys.to_vec(), (Const::<1>, Const::<6>));
+
+        let out = self.forward_raw(img);
+
+        out.as_vec()
+    }
+
+    pub(crate) fn get_move(&self, img: &[f32]) -> usize {
+        let p = self.forward(img);
+        let m = p.iter().fold(f32::NEG_INFINITY, |x, y| x.max(*y));
+        p.iter().position(|x| *x == m).expect("Was in the array")
+    }
+
+    fn forward_raw<const BATCH: usize>(
+        &self,
+        img: Tensor<Rank4<BATCH, 3, 400, 640>, f32, NetDevice, NoneTape>,
+    ) -> Tensor<Rank2<BATCH, INPUT_SIZE>, f32, NetDevice, NoneTape> {
+        let out_conv = self.net.0.forward(img);
+        let in_conv: Tensor<(Const<BATCH>, Const<LATENT_SIZE>), _, _, _> =
+            Flatten2D.forward(out_conv);
+        let out = self.net.1.forward(in_conv);
+        out
+    }
+
+    fn forward_raw_mut<const BATCH: usize>(
+        &mut self,
+        img: Tensor<Rank4<BATCH, 3, 400, 640>, f32, NetDevice, NetTape<f32, NetDevice>>,
+    ) -> Tensor<Rank2<BATCH, 32>, f32, NetDevice, NetTape<f32, NetDevice>> {
+        let out_conv = self.net.0.forward_mut(img);
+        let in_conv: Tensor<(Const<BATCH>, Const<LATENT_SIZE>), _, _, _> =
+            Flatten2D.forward(out_conv);
+        // let in_lin = (in_conv, keys).concat_along(Axis::<1>);
+        let out = self.net.1.forward_mut(in_conv);
+        out
+    }
+
+    pub(crate) fn do_conv(&self, img: &[f32]) -> Vec<Vec<f32>> {
+        let img: Tensor<Rank4<1, 3, 400, 640>, f32, NetDevice, NoneTape> =
+            self.dev.tensor_from_vec(
+                img.to_vec(),
+                (Const::<1>, Const::<3>, Const::<400>, Const::<640>),
+            );
+        let out = self.net.0.forward(img);
+        let arr = out.array();
+        arr[0]
+            .map(|x| x.iter().cloned().flatten().collect())
+            .to_vec()
+    }
+
+    pub(crate) fn acc_grad<const SS: usize>(
+        &mut self,
+        img: &[&[f32]],
+        keys: &[&[f32]],
+        out: &[&[f32]],
+        imgnext: &[Option<&[f32]>],
+        gamma: f32,
+    ) -> (f32, Gradients<f32, NetDevice>) {
+        let img = self.dev.tensor_from_vec(
+            img.iter().map(|&x| x).flatten().cloned().collect(),
+            (Const::<SS>, Const::<3>, Const::<400>, Const::<640>),
+        );
+        let out = self.dev.tensor_from_vec(
+            out.iter().map(|&x| x).flatten().cloned().collect(),
+            (Const::<SS>,),
+        );
+        let keys: Tensor<Rank2<SS, INPUT_SIZE>, _, _, _> = self.dev.tensor_from_vec(
+            keys.iter().map(|&x| x).flatten().cloned().collect(),
+            Rank2::default(),
+        );
+        let model_out = mul(self.forward_raw_mut(img.put_tape(self.grad.clone())), keys).sum();
+        let next_score = {
+            let mask = imgnext
+                .iter()
+                .map(|x| if x.is_some() { 1.0 } else { 0.0 })
+                .collect::<Vec<_>>();
+            let mask: Tensor<Rank2<SS, INPUT_SIZE>, _, _, _> =
+                self.dev.tensor_from_vec(mask, (Const::<SS>,)).broadcast();
+            let blank = vec![0.0; 3 * 640 * 400];
+            let imgnext: Vec<_> = imgnext
+                .iter()
+                .map(|&x| x.unwrap_or(&blank))
+                .flatten()
+                .cloned()
+                .collect();
+            // println!("{} {}", imgnext.len(), SS * 3 * 400 * 640);
+            let imgnext: Tensor<Rank4<SS, 3, 400, 640>, _, _, _> =
+                self.dev.tensor_from_vec(imgnext, Rank4::default());
+            let pred = mul(
+                self.forward_raw_mut(imgnext.put_tape(self.grad.clone())),
+                mask,
+            );
+            pred.max() * gamma + out
+        };
+        let err = next_score.huber_error(model_out, 1.0).sum();
+        let r = err.array();
+        let grad = err.backward();
+        (r, grad)
+    }
+    pub(crate) fn backward(&mut self, mut grad: Gradients<f32, NetDevice>) {
+        // let s = grad.get_ref_checked(&self.net.0 .1 .0.weight).unwrap();
+
+        // let v = &s.device().dtoh_sync_copy(s.deref()).unwrap();
+        // dbg!(&v[0..10]);
+
+        // TODO this is important
+        // clamp_grad(&mut grad, &self.net);
+
+        // let s = grad.get_ref_checked(&self.net.0 .1 .0.weight).unwrap();
+
+        // let v = &s.device().dtoh_sync_copy(s.deref()).unwrap();
+        // dbg!(&v[0..10]);
+
+        self.optim.update(&mut self.net, &grad).unwrap();
+
+        self.net.zero_grads(&mut grad);
+        grad.drop_non_leafs();
+        *self.grad.lock().unwrap() = grad.into();
+    }
+
+    pub(crate) fn train_grad<const SS: usize>(
+        &mut self,
+        img: &[&[f32]],
+        keys: &[&[f32]],
+        out: &[&[f32]],
+        imgnext: &[Option<&[f32]>],
+        gamma: f32,
+    ) -> f32 {
+        let (r, _) = self.acc_grad::<SS>(img, keys, out, imgnext, gamma);
+        r
+    }
+    pub(crate) fn grad(&self) -> Gradients<f32, NetDevice> {
+        self.net.alloc_grads()
+    }
+    pub(crate) fn pair_grad(
+        mut self,
+        mut critic: NetCrit,
+    ) -> (Self, NetCrit, Gradients<f32, NetDevice>) {
+        let g = (self.net, critic.net);
+        let grad = g.alloc_grads();
+        self.net = g.0;
+        critic.net = g.1;
+        (self, critic, grad)
+    }
+    pub(crate) fn decay_lr(&mut self, factor: f64) {
+        self.optim.cfg.lr *= factor;
+    }
+
+    pub(crate) fn get_lr(&self) -> f64 {
+        self.optim.cfg.lr
+    }
+    pub(crate) fn clear_grad(&self) {
+        let t = self
+            .dev
+            .tensor_from_vec(vec![0.], ())
+            .put_tape(self.grad.clone());
+        let mut grad = t.backward();
+        self.net.zero_grads(&mut grad);
+        grad.drop_non_leafs();
+        *self.grad.lock().unwrap() = grad.into();
+    }
 }

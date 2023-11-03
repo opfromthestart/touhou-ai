@@ -429,6 +429,7 @@ pub(crate) fn reset(pos: (i32, i32), nums: &[ImageA]) {
     start(pos, nums);
 }
 
+#[allow(dead_code)]
 pub(crate) fn get_enc_batch<R: Rng>(n: usize, r: &mut R) -> Vec<Image> {
     let files = fs::read_dir("images/encoder_data").unwrap();
     let to_ret: Vec<_> = files
@@ -463,8 +464,8 @@ pub(crate) fn get_actor_iter() -> ActImgSeq {
     ActImgSeq::new(to_ret)
 }
 pub(crate) struct ActImgSeq {
-    files: Vec<String>,
-    i: usize,
+    pub(crate) files: Vec<String>,
+    pub(crate) i: usize,
 }
 #[allow(dead_code)]
 impl ActImgSeq {
@@ -487,6 +488,14 @@ impl ActImgSeq {
         s.i -= 1;
         v
     }
+    pub(crate) fn split_test(self, test_fraction: usize) -> (Self, Self) {
+        let (mut train, mut test) = (vec![], vec![]);
+        for a in self.files.chunks(test_fraction) {
+            test.push(a[0].clone());
+            train.extend_from_slice(&a[1..]);
+        }
+        (Self { files: train, i: 0 }, Self { files: test, i: 0 })
+    }
 }
 impl Iterator for &mut ActImgSeq {
     type Item = Vec<f32>;
@@ -494,8 +503,11 @@ impl Iterator for &mut ActImgSeq {
     fn next(&mut self) -> Option<Self::Item> {
         let name = self.files.get(self.i)?;
         self.i += 1;
-        let img = image::open(name).unwrap().into_rgb8();
-        let img = to_pixels(&img);
+        let Some(img) = image::open(name).ok() else {
+            eprintln!("Error on file `{name}`");
+            return self.next();
+        };
+        let img = to_pixels(&img.into_rgb8());
         Some(img)
     }
 }
@@ -562,6 +574,15 @@ impl CritSeq {
     pub(crate) fn len(&self) -> usize {
         self.files.len()
     }
+
+    pub(crate) fn split_test(self, test_fraction: usize) -> (Self, Self) {
+        let (mut train, mut test) = (vec![], vec![]);
+        for a in self.files.chunks(test_fraction) {
+            test.push(a[0].clone());
+            train.extend_from_slice(&a[1..]);
+        }
+        (Self { files: train, i: 0 }, Self { files: test, i: 0 })
+    }
 }
 impl Iterator for &mut CritSeq {
     type Item = (Vec<f32>, Vec<f32>, f32);
@@ -579,8 +600,10 @@ impl Iterator for &mut CritSeq {
             return None;
         };
         let key = to_flat(&key);
-        let img = image::open(format!("{seq_name}.png")).unwrap().into_rgb8();
-        let img = to_pixels(&img);
+        let Some(img) = image::open(format!("{seq_name}.png")).ok() else {
+            return self.next();
+        };
+        let img = to_pixels(&img.into_rgb8());
         Some((img, key, score))
     }
 }
@@ -632,6 +655,90 @@ pub(crate) fn get_crit_iter() -> CritSeq {
         })
         .collect();
     CritSeq::new(to_ret)
+}
+pub(crate) struct QSeq {
+    files: Vec<String>,
+    i: usize,
+}
+impl QSeq {
+    fn new(files: Vec<String>) -> Self {
+        QSeq { files, i: 0 }
+    }
+
+    pub(crate) fn shuffle<R: Rng>(&mut self, r: &mut R) {
+        self.files[self.i..].shuffle(r);
+    }
+    pub(crate) fn reset(&mut self) {
+        self.i = 0;
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    pub(crate) fn split_test(self, test_fraction: usize) -> (Self, Self) {
+        let (mut train, mut test) = (vec![], vec![]);
+        for a in self.files.chunks(test_fraction) {
+            test.push(a[0].clone());
+            train.extend_from_slice(&a[1..]);
+        }
+        (Self { files: train, i: 0 }, Self { files: test, i: 0 })
+    }
+}
+impl Iterator for &mut QSeq {
+    // Image, keys,  score, next image
+    type Item = (Vec<f32>, Vec<f32>, f32, Option<Vec<f32>>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // if self.i > 100 {
+        //     return None;
+        // }
+        let name = self.files.get(self.i)?;
+        self.i += 1;
+        let seq_name = name.split(".").next().unwrap();
+        let json = std::fs::read_to_string(format!("{seq_name}.json")).unwrap();
+        // println!("{json} {seq_name}");
+        let Ok((keys, score)): Result<(Vec<f32>, f32), _> = serde_json::from_str(&json) else {
+            return None;
+        };
+        // let key = to_flat(&key);
+        let Some(img) = image::open(format!("{seq_name}.png")).ok() else {
+            return self.next();
+        };
+        let img = to_pixels(&img.into_rgb8());
+        // println!("{seq_name}");
+
+        // let i = seq_name.split("_");
+        // for j in i {
+        // println!("{j}, {} {:?}", j.len(), j.parse::<usize>());
+        // }
+        let mut i = seq_name.split("_").collect::<Vec<_>>();
+        let l = i.last_mut().unwrap();
+        let n = (l.parse::<usize>().unwrap() + 1).to_string();
+        *l = &n;
+        let mut next_name = i.into_iter().fold("".to_string(), |x, y| x + "_" + &y);
+        next_name.remove(0);
+        // println!("{seq_name} {next_name}");
+        let next = image::open(format!("{next_name}.png"))
+            .ok()
+            .map(|x| to_pixels(&x.into_rgb8()));
+        // println!("{:?}", next.as_ref().map(|x| x.len()));
+        Some((img, to_flat(&keys), score, next))
+    }
+}
+pub(crate) fn get_q_iter() -> QSeq {
+    let files = fs::read_dir("images/actor_critic_data").unwrap();
+    let to_ret: Vec<_> = files
+        .filter_map(|x| {
+            let y = x.unwrap();
+            // println!("{}", y.path().to_str().unwrap());
+            if y.file_type().unwrap().is_file() && y.path().to_str().unwrap().contains(".json") {
+                Some(y.path().to_str().unwrap().to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    QSeq::new(to_ret)
 }
 #[allow(dead_code)]
 pub(crate) fn process_crit_(gamma: f32) {
@@ -850,23 +957,23 @@ pub(crate) fn analyze_crit() {
     println!("Min {min} max {max}");
 }
 pub(crate) fn reset_from_gameover() {
-    thread::sleep(Duration::from_millis(5000));
+    thread::sleep(Duration::from_millis(4000));
     for _ in 0..2 {
-        println!("Rlset");
+        // println!("Rlset");
         do_keys(&[true, false, false, false, false, false]);
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(100));
         // println!("Rlset");
         do_keys(&[false, false, false, false, false, false]);
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(100));
     }
-    println!("Reset");
+    // println!("Reset");
     do_keys(&[false, false, false, true, false, false]);
-    thread::sleep(Duration::from_millis(200));
+    thread::sleep(Duration::from_millis(100));
     do_keys(&[false, false, false, false, false, false]);
-    thread::sleep(Duration::from_millis(200));
+    thread::sleep(Duration::from_millis(100));
     // println!("Reset");
     do_keys(&[true, false, false, false, false, false]);
-    thread::sleep(Duration::from_millis(200));
+    thread::sleep(Duration::from_millis(100));
     do_keys(&[false, false, false, false, false, false]);
     // println!("Reset");
     // thread::sleep(Duration::from_millis(3000));
